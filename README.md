@@ -63,14 +63,21 @@ python3 scripts/distro.py package
 
 - PR 和 main 推送运行轻量校验：补丁可应用、源码语法检查。
 - Actions 的 `Build and release` 支持手动运行，构建并保存可下载的 artifact。
+- 在 Releases 页面发布 Release（含预发布）后，自动构建对应 tag 的 Linux x86_64 二进制，14 项限额测试通过后上传到该 Release。只保存草稿不会触发。
 - 推送与 `VERSION` 对应的 `v*-cpu.*` tag，构建和测试通过后自动创建 GitHub Release 并上传发布包与校验文件。
+- Release 已存在时仅上传构建产物，保留标题、说明及预发布状态；重跑会替换同名产物。相同 tag 的发布流程串行运行。
 - 可用仓库变量 `WORKERD_RUNNER` 指定 Linux x86_64 大规格 runner 标签；未配置时使用 `ubuntu-24.04`。CI 默认并行度 2、内存调度预算 6000 MiB，可用仓库变量 `WORKERD_BUILD_JOBS` / `WORKERD_BUILD_MEMORY_MB` 调整。
 - 持久化 runner 可设置仓库变量 `WORKERD_BUILD_CACHE` 为专用绝对路径，提高后续构建速度；默认临时 runner 每次冷构建。构建任务没有发布权限；发布由单独任务使用 `contents: write`。
 
-```sh
-git tag v1.20260916.1-cpu.1
-git push origin v1.20260916.1-cpu.1
-```
+页面发版步骤：
+
+1. 将 `VERSION` 改为新版本（例如 `1.20260916.1-cpu.2`），提交到 main。
+2. 在 **Releases → Draft a new release** 中创建对应 tag `v1.20260916.1-cpu.2`，选择上述提交并点击 **Publish release**。
+3. 查看 Actions 的 **Build and release**。成功后，Release 的 **Assets** 会出现 `workerd-cpu-<版本>-linux-x86_64.tar.gz` 及校验、构建和测试记录；压缩包中包含可运行的 `workerd` 二进制。
+
+tag 必须指向已包含此工作流的提交，且与该提交的 `VERSION` 一致；已存在的 `cpu.1` tag 不会自动获得新触发逻辑。构建失败时 Release 本身仍存在，但不会上传失败的产物；修复源码应发新版本，网络等临时错误可在 Actions 中重跑失败任务。
+
+通过 Git 推送 tag 或在 GitHub 页面发布 Release 都可使用此流程。工作流用 `GITHUB_TOKEN` 自动创建的 Release 不会再次触发新的 release 工作流，因此正常的 tag 发版不会递归构建。手动运行选择分支时只生成 Actions artifact；选择符合版本规则的 tag 时也会发布到 Release。
 
 GitHub 自动生成的源码压缩包不包含完整 submodule 内容；开发者应使用 `git clone --recurse-submodules`。GitLab 或其他 CI 也可直接调用同一条 `python3 scripts/distro.py release`，再上传 `dist/`。
 

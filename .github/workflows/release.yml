@@ -1,5 +1,7 @@
 name: Build and release
 on:
+  release:
+    types: [published]
   workflow_dispatch:
   push:
     tags: ['v*-cpu.*']
@@ -63,4 +65,10 @@ jobs:
         run: |
           cd dist
           sha256sum -c *.sha256
-          gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "workerd CPU budget $RELEASE_TAG" ./*
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # A user may have published the Release before the binary was built.
+            # Keep its title, notes and prerelease status; retries replace our assets.
+            gh release upload "$RELEASE_TAG" ./* --clobber
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "workerd CPU budget $RELEASE_TAG" ./*
+          fi
