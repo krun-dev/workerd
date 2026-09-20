@@ -24,8 +24,8 @@ dist/                 发布包、构建记录、测试记录和 SHA-256，不�
 需要 Linux x86_64、Git、Python 3.10+、Docker。完整首次构建会编译 V8；建议 16 核、32 GiB 内存并预留至少 60 GiB 磁盘。小机器可降低并行度，构建时间会增加。
 
 ```sh
-git clone --recurse-submodules <你的发行仓库地址>
-cd <发行仓库目录>
+git clone --recurse-submodules https://github.com/krun-dev/workerd.git
+cd workerd
 WORKERD_BUILD_JOBS=12 WORKERD_BUILD_MEMORY_MB=18000 \
   python3 scripts/distro.py release
 ```
@@ -59,12 +59,7 @@ python3 scripts/distro.py package
 
 ## GitHub 构建和发布
 
-先创建自己的 GitHub 仓库，再推送本仓库。此模板没有预设远端地址，也不会上传到 Cloudflare 官方仓库。
-
-```sh
-git remote add origin <你的发行仓库地址>
-git push -u origin main
-```
+发行仓库为 [krun-dev/workerd](https://github.com/krun-dev/workerd)，发布包位于 [Releases](https://github.com/krun-dev/workerd/releases)。Cloudflare 官方源码通过 submodule 引用。
 
 - PR 和 main 推送运行轻量校验：补丁可应用、源码语法检查。
 - Actions 的 `Build and release` 支持手动运行，构建并保存可下载的 artifact。
@@ -105,6 +100,8 @@ python3 scripts/distro.py prepare
 补丁保存并检查后，提交发行仓库里的补丁和版本变更，再构建。临时 worktree 不属于发行仓库提交内容，上游主工作区也不会被改脏。若引入多个补丁，应逐个维护并按 `patches/series` 顺序验证。
 
 ## 使用
+
+首版 `1.20260916.1-cpu.1` 使用 Ubuntu 24.04 工具链，仍动态依赖 glibc。另已完成无需修改 workerd/V8 源码的静态 PIE 验证，详情见 [静态链接验证](docs/static-linking.md)；该实验尚未接入正式 Release 构建。
 
 ```sh
 tar -xzf workerd-cpu-1.20260916.1-cpu.1-linux-x86_64.tar.gz
