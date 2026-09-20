@@ -51,6 +51,9 @@ python3 scripts/distro.py package
 | `WORKERD_BUILD_MEMORY_MB` | 8000 | Bazel 内存调度预算，非容器硬限额 |
 | `WORKERD_BUILD_CACHE` | `.build/cache` | 持久化 Bazel 缓存目录 |
 | `WORKERD_BUILD_IMAGE` | 不设置 | 设置后使用已有本地构建镜像，跳过镜像构建 |
+| `WORKERD_BUILD_NETWORK` | `bridge` | Docker 构建进程的网络；Linux 上使用宿主机回环代理时设为 `host` |
+
+构建进程会按名称传入已设置的 HTTP(S)/ALL/NO_PROXY 环境变量，不将代理凭证打印到命令日志。若测试机不能直连 GitHub，可使用自己的网络代理；不能把本机回环代理地址直接用于 bridge 网络容器。
 
 当前构建镜像使用 Ubuntu 24.04、Clang 19、Bazel 9.2.0。原生二进制按 glibc 2.39 环境构建，不能承诺兼容 Ubuntu 22.04 的 glibc 2.35。若部署发行版较旧，应在所需最旧用户态环境中构建并验证；内核 6.6 本身具备此补丁需要的接口。镜像的 apt 包未锁定补丁版本，因此记录镜像 ID 便于追溯，但不宣称逐字节可复现。初版不提供 ARM64、npm 包或 OCI 发布。
 

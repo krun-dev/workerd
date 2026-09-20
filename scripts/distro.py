@@ -112,7 +112,14 @@ def build():
     flags = ['--repo_env=CC=clang-19', '--repository_cache=/cache/repository',
              '--config=release_linux', '--strip=always',
              f'--jobs={jobs}', f'--local_resources=memory={memory}', TARGET]
+    network = os.environ.get('WORKERD_BUILD_NETWORK', 'bridge')
+    proxy_args = []
+    for key in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+                'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy']:
+        if key in os.environ:
+            proxy_args += ['-e', key]  # Pass by name so credentials never appear in command logs.
     run(['docker', 'run', '--rm', '--platform=linux/amd64',
+         '--network', network, *proxy_args,
          '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'HOME=/tmp',
          '-v', f'{ROOT}:/repo', '-v', f'{cache}:/cache',
          '-w', '/repo/.build/workerd', image,
@@ -126,6 +133,7 @@ def build():
     data = json.loads((BUILD / 'inputs.json').read_text())
     data.update({'binary_sha256': sha(binary), 'build_image': image, 'build_image_id': image_id,
                  'bazel_flags': flags, 'platform': 'linux-x86_64',
+                 'build_network': network,
                  'libc_baseline': 'Ubuntu 24.04 / glibc 2.39',
                  'distro_commit': output(['git', 'rev-parse', 'HEAD']),
                  'distro_dirty': bool(output(['git', 'status', '--porcelain']))})
