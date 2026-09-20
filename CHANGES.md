@@ -3,8 +3,8 @@
 ## 1.20260920.1-krun.0
 
 - Upgrade the pinned official release to v1.20260920.1 (90faec3319d87b3ca98f8f522a1cc4295538d5ef). The CPU budget patch applies unchanged.
-- Build and test natively on Linux x86_64 and ARM64.
-- Match upstream Release assets: workerd-linux-64.gz and workerd-linux-arm64.gz only; provenance and full packages remain in Actions artifacts.
+- Build and test natively on Linux AMD64.
+- Match upstream Release assets: workerd-linux-64.gz only; provenance and full packages remain in Actions artifacts.
 
 ## Versioning and packaging changes (previously unreleased)
 

@@ -42,18 +42,6 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2) + '\n')
 
 
-def architecture():
-    if platform.system() != 'Linux':
-        raise RuntimeError('Build and integration tests require native Linux.')
-    targets = {'x86_64': ('x86_64', 'amd64', '64'),
-               'aarch64': ('arm64', 'arm64', 'arm64'),
-               'arm64': ('arm64', 'arm64', 'arm64')}
-    try:
-        return targets[platform.machine()]
-    except KeyError:
-        raise RuntimeError('Supported Linux architectures: x86_64 and ARM64.') from None
-
-
 def inputs():
     if not (UPSTREAM / '.git').exists():
         raise RuntimeError('Run git submodule update --init --recursive first.')
@@ -122,13 +110,10 @@ def prepare():
 
 
 def build():
-    arch, docker_arch, _ = architecture()
     prepare()
-    image = os.environ.get('WORKERD_BUILD_IMAGE', f'workerd-builder:ubuntu24-clang19-bazel9.2.0-{docker_arch}')
+    image = os.environ.get('WORKERD_BUILD_IMAGE', 'workerd-cpu-builder:ubuntu24-clang19-bazel9.2.0')
     if 'WORKERD_BUILD_IMAGE' not in os.environ:
-        run(['docker', 'build', '--platform', f'linux/{docker_arch}',
-             '--build-arg', f'TARGETARCH={docker_arch}',
-             '-f', 'docker/Dockerfile.build', '-t', image, 'docker'])
+        run(['docker', 'build', '-f', 'docker/Dockerfile.build', '-t', image, 'docker'])
     image_id = output(['docker', 'image', 'inspect', '--format', '{{.Id}}', image])
     cache = Path(os.environ.get('WORKERD_BUILD_CACHE', str(BUILD / 'cache'))).resolve()
     cache.mkdir(parents=True, exist_ok=True)
@@ -145,7 +130,7 @@ def build():
                 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy']:
         if key in os.environ:
             proxy_args += ['-e', key]  # Pass by name so credentials never appear in command logs.
-    run(['docker', 'run', '--rm', f'--platform=linux/{docker_arch}',
+    run(['docker', 'run', '--rm', '--platform=linux/amd64',
          '--network', network, *proxy_args,
          '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'HOME=/tmp',
          '-v', f'{ROOT}:/repo', '-v', f'{cache}:/cache',
@@ -154,7 +139,7 @@ def build():
     # bazel-bin is a symlink into a container path. Copy the binary while that path is mounted.
     staged_binary = BUILD / 'workerd-release.new'
     staged_binary.unlink(missing_ok=True)
-    run(['docker', 'run', '--rm', f'--platform=linux/{docker_arch}',
+    run(['docker', 'run', '--rm', '--platform=linux/amd64',
          '--user', f'{os.getuid()}:{os.getgid()}',
          '-v', f'{ROOT}:/repo', '-v', f'{cache}:/cache', image,
          'cp', '/repo/.build/workerd/bazel-bin/src/workerd/server/workerd', '/repo/.build/workerd-release.new'])
@@ -163,7 +148,7 @@ def build():
     staged_binary.replace(binary)
     data = json.loads((BUILD / 'inputs.json').read_text())
     data.update({'binary_sha256': sha(binary), 'build_image': image, 'build_image_id': image_id,
-                 'bazel_flags': flags, 'platform': f'linux-{arch}',
+                 'bazel_flags': flags, 'platform': 'linux-x86_64',
                  'build_network': network,
                  'libc_baseline': 'Ubuntu 24.04 / glibc 2.39',
                  'distro_commit': output(['git', 'rev-parse', 'HEAD']),
@@ -172,7 +157,8 @@ def build():
 
 
 def test(binary=None):
-    architecture()
+    if platform.system() != 'Linux' or platform.machine() != 'x86_64':
+        raise RuntimeError('Integration tests require a native Linux x86_64 host.')
     binary = Path(binary or BUILD / 'workerd-release').resolve()
     # Fixed test ports are owned only by this test run. Fail before starting if unavailable.
     import socket
@@ -219,10 +205,7 @@ def package():
         raise RuntimeError('Release packaging requires a clean, committed distribution repository.')
     if build_data['distro_commit'] != output(['git', 'rev-parse', 'HEAD']):
         raise RuntimeError('Distribution commit changed since build.')
-    arch, _, asset_arch = architecture()
-    if build_data['platform'] != f'linux-{arch}':
-        raise RuntimeError('Build architecture does not match the packaging host.')
-    name = f"workerd-{current['version']}-linux-{arch}"
+    name = f"workerd-{current['version']}-linux-x86_64"
     dist = ROOT / 'dist'
     dist.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='package-', dir=BUILD) as tmp:
@@ -241,7 +224,7 @@ def package():
     shutil.copy2(BUILD / 'build.json', dist / f'{name}.build-info.json')
     shutil.copy2(BUILD / 'test.json', dist / f'{name}.test-info.json')
     # Match upstream's directly downloadable gzip-compressed Linux executable.
-    compressed = dist / f'workerd-linux-{asset_arch}.gz'
+    compressed = dist / 'workerd-linux-64.gz'
     with binary.open('rb') as source, compressed.open('wb') as target:
         with gzip.GzipFile(filename='workerd', mode='wb', fileobj=target, mtime=0) as archive:
             shutil.copyfileobj(source, archive)
