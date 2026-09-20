@@ -165,6 +165,8 @@ def test(binary=None):
     for key in list(env):
         if key.startswith('WORKERD_EXPERIMENTAL_'):
             del env[key]
+    # Tests address only local Workers, even when dependency downloads need a proxy.
+    env['NO_PROXY'] = env['no_proxy'] = '127.0.0.1,localhost'
     run([sys.executable, directory / 'integration.py', binary], env=env)
     results = json.loads((directory / 'results.json').read_text())
     if len(results['checks']) != 14 or not all(results['checks'].values()):
