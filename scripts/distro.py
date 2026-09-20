@@ -125,11 +125,15 @@ def build():
          '-w', '/repo/.build/workerd', image,
          'bazel', '--output_user_root=/cache/bazel', '--batch', 'build', *flags])
     # bazel-bin is a symlink into a container path. Copy the binary while that path is mounted.
+    staged_binary = BUILD / 'workerd-release.new'
+    staged_binary.unlink(missing_ok=True)
     run(['docker', 'run', '--rm', '--platform=linux/amd64',
          '--user', f'{os.getuid()}:{os.getgid()}',
          '-v', f'{ROOT}:/repo', '-v', f'{cache}:/cache', image,
-         'cp', '/repo/.build/workerd/bazel-bin/src/workerd/server/workerd', '/repo/.build/workerd-release'])
+         'cp', '/repo/.build/workerd/bazel-bin/src/workerd/server/workerd', '/repo/.build/workerd-release.new'])
     binary = BUILD / 'workerd-release'
+    staged_binary.chmod(0o755)
+    staged_binary.replace(binary)
     data = json.loads((BUILD / 'inputs.json').read_text())
     data.update({'binary_sha256': sha(binary), 'build_image': image, 'build_image_id': image_id,
                  'bazel_flags': flags, 'platform': 'linux-x86_64',
