@@ -1,5 +1,12 @@
 # Distribution changes
 
+## 1.20260916.1-krun.0 (unreleased)
+
+- Preserve the exact upstream release version and append `-krun.N`, starting at zero for each new upstream version.
+- Add `next-version` to increment the downstream revision or reset it when changing upstream, and validate VERSION against the pinned upstream tag.
+- Publish `workerd-linux-64.gz` alongside the full distribution archive, following upstream's Linux binary naming.
+- Keep the historical `1.20260916.1-cpu.1` release unchanged.
+
 ## 1.20260916.1-cpu.1
 
 - Base: Cloudflare workerd v1.20260916.1, commit adda2635656d09e541b0feeea796da9d2a8bc10e.

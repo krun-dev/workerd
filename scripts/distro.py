@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Build a pinned workerd plus an ordered patch series. Python stdlib only."""
 import argparse
+import gzip
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
-import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import versioning
 
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM = ROOT / 'upstream/workerd'
@@ -51,8 +52,8 @@ def inputs():
     if len(entry) < 2 or entry[0] != '160000' or entry[1] != commit:
         raise RuntimeError('Submodule checkout differs from the gitlink. Stage the intended upstream revision.')
     version = (ROOT / 'VERSION').read_text().strip()
-    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+-cpu\.[0-9]+', version):
-        raise RuntimeError('VERSION must have the form 1.20260916.1-cpu.1')
+    upstream_version = versioning.upstream_version(UPSTREAM)
+    versioning.validate(version, upstream_version)
     patches = []
     for name in (ROOT / 'patches/series').read_text().splitlines():
         name = name.strip()
@@ -63,10 +64,21 @@ def inputs():
         patches.append({'file': name, 'sha256': sha(ROOT / 'patches' / name)})
     if not patches:
         raise RuntimeError('Empty patch series.')
-    files = ['scripts/distro.py', 'docker/Dockerfile.build', 'tests/integration.py']
+    files = ['scripts/distro.py', 'scripts/versioning.py', 'docker/Dockerfile.build', 'tests/integration.py']
     files += [str(p.relative_to(ROOT)) for p in sorted((ROOT / 'tests/fixtures').iterdir()) if p.is_file()]
-    return {'version': version, 'upstream_commit': commit, 'patches': patches,
+    return {'version': version, 'upstream_version': upstream_version,
+            'upstream_commit': commit, 'patches': patches,
             'recipe': {p: sha(ROOT / p) for p in files}}
+
+
+def next_version():
+    if output(['git', 'status', '--porcelain'], UPSTREAM):
+        raise RuntimeError('Keep the upstream submodule clean before selecting a version.')
+    version = versioning.next_version(
+        versioning.upstream_version(UPSTREAM), (ROOT / 'VERSION').read_text().strip(),
+        output(['git', 'tag', '--list', 'v*-krun.*']).splitlines())
+    (ROOT / 'VERSION').write_text(version + '\n')
+    print('Next distribution version:', version)
 
 
 def prepare():
@@ -193,7 +205,7 @@ def package():
         raise RuntimeError('Release packaging requires a clean, committed distribution repository.')
     if build_data['distro_commit'] != output(['git', 'rev-parse', 'HEAD']):
         raise RuntimeError('Distribution commit changed since build.')
-    name = f"workerd-cpu-{current['version']}-linux-x86_64"
+    name = f"workerd-{current['version']}-linux-x86_64"
     dist = ROOT / 'dist'
     dist.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='package-', dir=BUILD) as tmp:
@@ -211,14 +223,20 @@ def package():
             archive.add(stage, arcname=name)
     shutil.copy2(BUILD / 'build.json', dist / f'{name}.build-info.json')
     shutil.copy2(BUILD / 'test.json', dist / f'{name}.test-info.json')
+    # Match upstream's directly downloadable gzip-compressed Linux executable.
+    compressed = dist / 'workerd-linux-64.gz'
+    with binary.open('rb') as source, compressed.open('wb') as target:
+        with gzip.GzipFile(filename='workerd', mode='wb', fileobj=target, mtime=0) as archive:
+            shutil.copyfileobj(source, archive)
     artifacts = [dist / f'{name}{suffix}' for suffix in ['.tar.gz', '.build-info.json', '.test-info.json']]
+    artifacts.append(compressed)
     (dist / f'{name}.sha256').write_text(''.join(f'{sha(p)}  {p.name}\n' for p in artifacts))
     print('Release assets:', dist)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['prepare', 'build', 'test', 'package', 'release'])
+    parser.add_argument('command', choices=['next-version', 'prepare', 'build', 'test', 'package', 'release'])
     parser.add_argument('--binary', help='Existing binary for test only; never relabelled as a release build.')
     args = parser.parse_args()
     if args.binary and args.command != 'test':
@@ -230,11 +248,11 @@ def main():
     elif args.command == 'test':
         test(args.binary)
     else:
-        globals()[args.command]()
+        globals()[args.command.replace('-', '_')]()
 
 
 if __name__ == '__main__':
     try:
         main()
-    except (RuntimeError, subprocess.CalledProcessError) as error:
+    except (RuntimeError, ValueError, subprocess.CalledProcessError) as error:
         sys.exit(str(error))

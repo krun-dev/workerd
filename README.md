@@ -1,4 +1,4 @@
-# workerd CPU-budget distribution
+# krun workerd distribution
 
 基于官方 workerd 的独立 Linux x86_64 发行仓库，增加同进程、每请求 CPU 执行预算。上游作为 Git submodule 固定在一个 commit；自己的代码改动保存在 `patches/`，构建时应用到临时源码目录。
 
@@ -9,7 +9,7 @@ upstream/workerd/       官方 submodule，保持干净
 patches/series         补丁顺序
 patches/*.patch        本发行版代码改动
 VERSION               独立发行版本号
-scripts/distro.py      prepare / build / test / package / release
+scripts/distro.py      next-version / prepare / build / test / package / release
 docker/Dockerfile.build 固定 Bazel / Clang 主版本的构建环境
 tests/                CPU 限额集成测试与两个 Worker 的配置
 .github/workflows/    GitHub Actions 校验、构建和 Release
@@ -17,7 +17,29 @@ tests/                CPU 限额集成测试与两个 Worker 的配置
 dist/                 发布包、构建记录、测试记录和 SHA-256，不提交
 ```
 
-首版上游为 `v1.20260916.1`，commit `adda2635656d09e541b0feeea796da9d2a8bc10e`，发行版本为 `1.20260916.1-cpu.1`。submodule 的 gitlink 是上游版本的权威来源，不跟随上游 main 自动漂移。
+当前上游为 `v1.20260916.1`，commit `adda2635656d09e541b0feeea796da9d2a8bc10e`，待发布版本为 `1.20260916.1-krun.0`。submodule 的 gitlink 是上游版本的权威来源，不跟随上游 main 自动漂移。
+
+## 版本规则
+
+完整保留官方 `主版本.日期.补丁号`，追加 `-krun.N`；Git tag 为 `v<版本>`，Release 标题使用同一个 tag。日期来自固定的上游版本，不使用我们构建当天的日期。
+
+| 场景 | 版本 |
+| --- | --- |
+| 首次基于上游 `v1.20260916.1` 发布 | `1.20260916.1-krun.0` |
+| 同一上游继续发布 | `1.20260916.1-krun.1`、`1.20260916.1-krun.2` |
+| 升级上游为 `v1.20260917.1` | `1.20260917.1-krun.0` |
+| 上游自身补丁号升级为 `v1.20260917.2` | `1.20260917.2-krun.0` |
+
+准备下一版时运行：
+
+```sh
+git fetch origin --tags
+python3 scripts/distro.py next-version
+```
+
+命令读取 submodule HEAD 对应的官方 tag，以及当前 VERSION 和本地发行 tag：同一上游递增；新上游从 0 开始。每次执行都会推进版本，随后检查并提交 VERSION。若切回曾发布过的旧上游，则沿用该上游已用的最大序号继续递增，避免重复 tag。命令不会拉取或升级上游、自动提交或发版。
+
+`prepare` / `build` 会校验 VERSION 的上游部分确实与 submodule 的官方 tag 一致，防止给旧源码标上新版本。历史 `1.20260916.1-cpu.1` 保留，本次命名迁移从 `krun.0` 开始。
 
 ## 构建 Release
 
@@ -64,16 +86,16 @@ python3 scripts/distro.py package
 - PR 和 main 推送运行轻量校验：补丁可应用、源码语法检查。
 - Actions 的 `Build and release` 支持手动运行，构建并保存可下载的 artifact。
 - 在 Releases 页面发布 Release（含预发布）后，自动构建对应 tag 的 Linux x86_64 二进制，14 项限额测试通过后上传到该 Release。只保存草稿不会触发。
-- 推送与 `VERSION` 对应的 `v*-cpu.*` tag，构建和测试通过后自动创建 GitHub Release 并上传发布包与校验文件。
+- 推送与 `VERSION` 对应的 `v*-krun.*` tag，构建和测试通过后自动创建 GitHub Release 并上传发布包与校验文件。
 - Release 已存在时仅上传构建产物，保留标题、说明及预发布状态；重跑会替换同名产物。相同 tag 的发布流程串行运行。
 - 可用仓库变量 `WORKERD_RUNNER` 指定 Linux x86_64 大规格 runner 标签；未配置时使用 `ubuntu-24.04`。CI 默认并行度 2、内存调度预算 6000 MiB，可用仓库变量 `WORKERD_BUILD_JOBS` / `WORKERD_BUILD_MEMORY_MB` 调整。
 - 持久化 runner 可设置仓库变量 `WORKERD_BUILD_CACHE` 为专用绝对路径，提高后续构建速度；默认临时 runner 每次冷构建。构建任务没有发布权限；发布由单独任务使用 `contents: write`。
 
 页面发版步骤：
 
-1. 将 `VERSION` 改为新版本（例如 `1.20260916.1-cpu.2`），提交到 main。
-2. 在 **Releases → Draft a new release** 中创建对应 tag `v1.20260916.1-cpu.2`，选择上述提交并点击 **Publish release**。
-3. 查看 Actions 的 **Build and release**。成功后，Release 的 **Assets** 会出现 `workerd-cpu-<版本>-linux-x86_64.tar.gz` 及校验、构建和测试记录；压缩包中包含可运行的 `workerd` 二进制。
+1. 运行 `next-version` 准备下一版并提交到 main；当前尚未发布的 `1.20260916.1-krun.0` 可直接使用，不必再递增。
+2. 在 **Releases → Draft a new release** 中创建与 VERSION 一致的 tag（例如 `v1.20260916.1-krun.0`），选择上述提交并点击 **Publish release**。
+3. 查看 Actions 的 **Build and release**。成功后，Release 的 **Assets** 会出现 `workerd-linux-64.gz`（与上游相同的压缩二进制命名）、`workerd-<版本>-linux-x86_64.tar.gz` 完整发行包及校验、构建和测试记录。
 
 tag 必须指向已包含此工作流的提交，且与该提交的 `VERSION` 一致；已存在的 `cpu.1` tag 不会自动获得新触发逻辑。构建失败时 Release 本身仍存在，但不会上传失败的产物；修复源码应发新版本，网络等临时错误可在 Actions 中重跑失败任务。
 
@@ -87,10 +109,11 @@ GitHub 自动生成的源码压缩包不包含完整 submodule 内容；开发�
 git -C upstream/workerd fetch origin tag <目标官方tag>
 git -C upstream/workerd checkout --detach <目标官方tag>
 git add upstream/workerd
+python3 scripts/distro.py next-version
 python3 scripts/distro.py prepare
 ```
 
-补丁冲突会立即失败，不会静默跳过。解决方式是在导出的临时源码中适配修改，重新生成相对目标上游的补丁，再运行 prepare。更新 `VERSION`，提交 gitlink、补丁和版本后再 release。无需维护一套 V8 分支。
+补丁冲突会立即失败，不会静默跳过。解决方式是在导出的临时源码中适配修改，重新生成相对目标上游的补丁，再运行 prepare。确认自动生成的 `VERSION`，提交 gitlink、补丁和版本后再 release。无需维护一套 V8 分支。
 
 修改自己的补丁时，可在独立 worktree 中编辑正常的 C++ 文件，避免手工维护 diff 的行号。以下命令在发行仓库根目录运行，适用于当前单补丁布局：
 
@@ -108,15 +131,17 @@ python3 scripts/distro.py prepare
 
 ## 使用
 
-首版 `1.20260916.1-cpu.1` 使用 Ubuntu 24.04 工具链，仍动态依赖 glibc。另已完成无需修改 workerd/V8 源码的静态 PIE 验证，详情见 [静态链接验证](docs/static-linking.md)；该实验尚未接入正式 Release 构建。
+当前构建使用 Ubuntu 24.04 工具链，仍动态依赖 glibc。另已完成无需修改 workerd/V8 源码的静态 PIE 验证，详情见 [静态链接验证](docs/static-linking.md)；该实验尚未接入正式 Release 构建。
 
 ```sh
-tar -xzf workerd-cpu-1.20260916.1-cpu.1-linux-x86_64.tar.gz
-cd workerd-cpu-1.20260916.1-cpu.1-linux-x86_64
+tar -xzf workerd-1.20260916.1-krun.0-linux-x86_64.tar.gz
+cd workerd-1.20260916.1-krun.0-linux-x86_64
 WORKERD_EXPERIMENTAL_CPU_MS=50 \
 WORKERD_EXPERIMENTAL_CPU_POLL_MS=10 \
 ./workerd serve /path/to/config.capnp
 ```
+
+也可只下载 Release 的 `workerd-linux-64.gz`，执行 `gzip -dc workerd-linux-64.gz > workerd && chmod +x workerd`。该文件的版本由所在的 Release tag 标识，校验值包含在同一 Release 的 `.sha256` 文件内。
 
 - `WORKERD_EXPERIMENTAL_CPU_MS`：每请求执行线程 CPU 预算，毫秒，默认 0（关闭）。
 - `WORKERD_EXPERIMENTAL_CPU_POLL_MS`：检查间隔，默认 10 ms，整数 1～100。

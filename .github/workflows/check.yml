@@ -13,6 +13,7 @@ jobs:
         with:
           submodules: recursive
           persist-credentials: false
-      - run: python3 -m py_compile scripts/distro.py tests/integration.py
+      - run: python3 -m py_compile scripts/distro.py scripts/versioning.py tests/integration.py
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: python3 scripts/distro.py prepare
       - run: git diff --exit-code && test -z "$(git -C upstream/workerd status --porcelain)"

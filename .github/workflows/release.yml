@@ -4,7 +4,7 @@ on:
     types: [published]
   workflow_dispatch:
   push:
-    tags: ['v*-cpu.*']
+    tags: ['v*-krun.*']
 permissions:
   contents: read
 concurrency:
@@ -34,7 +34,7 @@ jobs:
           python3 scripts/distro.py release
       - uses: actions/upload-artifact@v7
         with:
-          name: workerd-cpu-linux-x86_64
+          name: workerd-linux-x86_64
           path: dist/*
           if-no-files-found: error
           retention-days: 14
@@ -55,7 +55,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: workerd-cpu-linux-x86_64
+          name: workerd-linux-x86_64
           path: dist
       - name: Publish verified assets
         env:
@@ -70,5 +70,5 @@ jobs:
             # Keep its title, notes and prerelease status; retries replace our assets.
             gh release upload "$RELEASE_TAG" ./* --clobber
           else
-            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "workerd CPU budget $RELEASE_TAG" ./*
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG" ./*
           fi
