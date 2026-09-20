@@ -13,7 +13,7 @@ import distro
 
 
 class PackageTests(unittest.TestCase):
-    def test_compressed_binary_and_manifest(self):
+    def check_package(self, arch, docker_arch, asset_arch):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             build = root / '.build'
@@ -29,22 +29,30 @@ class PackageTests(unittest.TestCase):
             inputs = {'version': '1.20260916.1-krun.0'}
             digest = hashlib.sha256(binary).hexdigest()
             (build / 'build.json').write_text(json.dumps(dict(inputs, binary_sha256=digest,
-                    distro_dirty=False, distro_commit='abc')))
+                    distro_dirty=False, distro_commit='abc', platform=f'linux-{arch}')))
             (build / 'test.json').write_text(json.dumps({'inputs': inputs, 'binary_sha256': digest}))
             with patch.multiple(distro, ROOT=root, BUILD=build, UPSTREAM=upstream), \
+                    patch.object(distro, 'architecture', return_value=(arch, docker_arch, asset_arch)), \
                     patch.object(distro, 'inputs', return_value=inputs), \
                     patch.object(distro, 'output', side_effect=lambda args: 'abc' if args[1] == 'rev-parse' else ''):
                 distro.package()
-                self.assertEqual(gzip.decompress((root / 'dist/workerd-linux-64.gz').read_bytes()), binary)
+                asset_name = f'workerd-linux-{asset_arch}.gz'
+                self.assertEqual(gzip.decompress((root / 'dist' / asset_name).read_bytes()), binary)
                 manifest = next((root / 'dist').glob('*.sha256'))
                 entries = [line.split() for line in manifest.read_text().splitlines()]
                 self.assertEqual(len(entries), 4)
-                self.assertIn('workerd-linux-64.gz', [name for _, name in entries])
+                self.assertIn(asset_name, [name for _, name in entries])
                 for checksum, name in entries:
                     self.assertEqual(hashlib.sha256((root / 'dist' / name).read_bytes()).hexdigest(), checksum)
                 (build / 'workerd-release').write_bytes(b'untested replacement')
                 with self.assertRaisesRegex(RuntimeError, 'exact binary'):
                     distro.package()
+
+    def test_x64_package(self):
+        self.check_package('x86_64', 'amd64', '64')
+
+    def test_arm64_package(self):
+        self.check_package('arm64', 'arm64', 'arm64')
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 # krun workerd distribution
 
-基于官方 workerd 的独立 Linux x86_64 发行仓库，增加同进程、每请求 CPU 执行预算。上游作为 Git submodule 固定在一个 commit；自己的代码改动保存在 `patches/`，构建时应用到临时源码目录。
+基于官方 workerd 的独立 Linux x86_64 / ARM64 发行仓库，增加同进程、每请求 CPU 执行预算。上游作为 Git submodule 固定在一个 commit；自己的代码改动保存在 `patches/`，构建时应用到临时源码目录。
 
 ## 仓库结构
 
@@ -17,7 +17,7 @@ tests/                CPU 限额集成测试与两个 Worker 的配置
 dist/                 发布包、构建记录、测试记录和 SHA-256，不提交
 ```
 
-当前上游为 `v1.20260916.1`，commit `adda2635656d09e541b0feeea796da9d2a8bc10e`，待发布版本为 `1.20260916.1-krun.0`。submodule 的 gitlink 是上游版本的权威来源，不跟随上游 main 自动漂移。
+当前上游为 `v1.20260920.1`，commit `90faec3319d87b3ca98f8f522a1cc4295538d5ef`，发行版本为 `1.20260920.1-krun.0`。submodule 的 gitlink 是上游版本的权威来源，不跟随上游 main 自动漂移。
 
 ## 版本规则
 
@@ -43,7 +43,7 @@ python3 scripts/distro.py next-version
 
 ## 构建 Release
 
-需要 Linux x86_64、Git、Python 3.10+、Docker。完整首次构建会编译 V8；建议 16 核、32 GiB 内存并预留至少 60 GiB 磁盘。小机器可降低并行度，构建时间会增加。
+需要 Linux x86_64 或 ARM64、Git、Python 3.10+、Docker。完整首次构建会编译 V8；建议 16 核、32 GiB 内存并预留至少 60 GiB 磁盘。小机器可降低并行度，构建时间会增加。
 
 ```sh
 git clone --recurse-submodules https://github.com/krun-dev/workerd.git
@@ -77,29 +77,29 @@ python3 scripts/distro.py package
 
 构建进程会按名称传入已设置的 HTTP(S)/ALL/NO_PROXY 环境变量，不将代理凭证打印到命令日志。若测试机不能直连 GitHub，可使用自己的网络代理；不能把本机回环代理地址直接用于 bridge 网络容器。
 
-当前构建镜像使用 Ubuntu 24.04、Clang 19、Bazel 9.2.0。原生二进制按 glibc 2.39 环境构建，不能承诺兼容 Ubuntu 22.04 的 glibc 2.35。若部署发行版较旧，应在所需最旧用户态环境中构建并验证；内核 6.6 本身具备此补丁需要的接口。镜像的 apt 包未锁定补丁版本，因此记录镜像 ID 便于追溯，但不宣称逐字节可复现。初版不提供 ARM64、npm 包或 OCI 发布。
+当前构建镜像使用 Ubuntu 24.04、Clang 19、Bazel 9.2.0。原生二进制按 glibc 2.39 环境构建，不能承诺兼容 Ubuntu 22.04 的 glibc 2.35。若部署发行版较旧，应在所需最旧用户态环境中构建并验证；内核 6.6 本身具备此补丁需要的接口。镜像的 apt 包未锁定补丁版本，因此记录镜像 ID 便于追溯，但不宣称逐字节可复现。两种架构均在对应的原生 Linux 上构建和执行测试；不提供 npm 包或 OCI 发布。
 
 ## GitHub 构建和发布
 
 发行仓库为 [krun-dev/workerd](https://github.com/krun-dev/workerd)，发布包位于 [Releases](https://github.com/krun-dev/workerd/releases)。Cloudflare 官方源码通过 submodule 引用。
 
 - PR 和 main 推送运行轻量校验：补丁可应用、源码语法检查。
-- Actions 的 `Build and release` 支持手动运行，构建并保存可下载的 artifact。
-- 在 Releases 页面发布 Release（含预发布）后，自动构建对应 tag 的 Linux x86_64 二进制，14 项限额测试通过后上传到该 Release。只保存草稿不会触发。
-- 推送与 `VERSION` 对应的 `v*-krun.*` tag，构建和测试通过后自动创建 GitHub Release 并上传发布包与校验文件。
+- Actions 的 `Build and release` 支持手动运行，构建并保存可下载的 artifact。勾选 `publish` 后，两种架构构建及测试都通过才创建 VERSION 对应的 tag / Release 并上传二进制。
+- 在 Releases 页面发布 Release（含预发布）后，自动构建对应 tag 的 Linux x86_64 和 ARM64 二进制，14 项限额测试通过后上传到该 Release。只保存草稿不会触发。
+- 推送与 `VERSION` 对应的 `v*-krun.*` tag，构建和测试通过后自动创建 GitHub Release 并上传两个 Linux 压缩二进制。
 - Release 已存在时仅上传构建产物，保留标题、说明及预发布状态；重跑会替换同名产物。相同 tag 的发布流程串行运行。
-- 可用仓库变量 `WORKERD_RUNNER` 指定 Linux x86_64 大规格 runner 标签；未配置时使用 `ubuntu-24.04`。CI 默认并行度 2、内存调度预算 6000 MiB，可用仓库变量 `WORKERD_BUILD_JOBS` / `WORKERD_BUILD_MEMORY_MB` 调整。
-- 持久化 runner 可设置仓库变量 `WORKERD_BUILD_CACHE` 为专用绝对路径，提高后续构建速度；默认临时 runner 每次冷构建。构建任务没有发布权限；发布由单独任务使用 `contents: write`。
+- x64 默认使用 `ubuntu-24.04`，ARM64 使用 `ubuntu-24.04-arm`。可分别用仓库变量 `WORKERD_RUNNER_X64` / `WORKERD_RUNNER_ARM64` 指定同架构的大规格 runner。每个构建默认并行度 3、内存调度预算 10000 MiB，可用 `WORKERD_BUILD_JOBS` / `WORKERD_BUILD_MEMORY_MB` 调整。
+- 持久化 runner 可设置仓库变量 `WORKERD_BUILD_CACHE` 为专用绝对路径，提高后续构建速度；CI 会在缓存路径后追加机器架构，避免两种架构共用同一个 Bazel 输出目录；默认临时 runner 每次冷构建。构建任务没有发布权限；发布由单独任务使用 `contents: write`。
 
 页面发版步骤：
 
-1. 运行 `next-version` 准备下一版并提交到 main；当前尚未发布的 `1.20260916.1-krun.0` 可直接使用，不必再递增。
-2. 在 **Releases → Draft a new release** 中创建与 VERSION 一致的 tag（例如 `v1.20260916.1-krun.0`），选择上述提交并点击 **Publish release**。
-3. 查看 Actions 的 **Build and release**。成功后，Release 的 **Assets** 会出现 `workerd-linux-64.gz`（与上游相同的压缩二进制命名）、`workerd-<版本>-linux-x86_64.tar.gz` 完整发行包及校验、构建和测试记录。
+1. 运行 `next-version` 准备下一版并提交到 main；当前的 `1.20260920.1-krun.0` 在首次发布时可直接使用，不必再递增。
+2. 在 **Releases → Draft a new release** 中创建与 VERSION 一致的 tag（例如 `v1.20260920.1-krun.0`），选择上述提交并点击 **Publish release**。
+3. 查看 Actions 的 **Build and release**。成功后，Release 的 **Assets** 只上传 `workerd-linux-64.gz` 和 `workerd-linux-arm64.gz`，命名与上游一致。GitHub 还会自动显示 Source code (zip / tar.gz)，这两项不是额外的平台二进制。完整发行包、校验文件和构建/测试记录保存在 Actions artifacts（默认 14 天），不作为 Release 附件上传。
 
 tag 必须指向已包含此工作流的提交，且与该提交的 `VERSION` 一致；已存在的 `cpu.1` tag 不会自动获得新触发逻辑。构建失败时 Release 本身仍存在，但不会上传失败的产物；修复源码应发新版本，网络等临时错误可在 Actions 中重跑失败任务。
 
-通过 Git 推送 tag 或在 GitHub 页面发布 Release 都可使用此流程。工作流用 `GITHUB_TOKEN` 自动创建的 Release 不会再次触发新的 release 工作流，因此正常的 tag 发版不会递归构建。手动运行选择分支时只生成 Actions artifact；选择符合版本规则的 tag 时也会发布到 Release。
+通过 Git 推送 tag 或在 GitHub 页面发布 Release 都可使用此流程。工作流用 `GITHUB_TOKEN` 自动创建的 tag / Release 不会再次触发新的工作流。手动运行选择分支时默认只生成 Actions artifact，勾选 `publish` 才发版；选择符合版本规则的 tag 时也会发布到 Release。重试只允许给指向同一构建提交的 tag 上传，不会将另一提交的二进制覆盖到旧版本。
 
 GitHub 自动生成的源码压缩包不包含完整 submodule 内容；开发者应使用 `git clone --recurse-submodules`。GitLab 或其他 CI 也可直接调用同一条 `python3 scripts/distro.py release`，再上传 `dist/`。
 
@@ -133,15 +133,18 @@ python3 scripts/distro.py prepare
 
 当前构建使用 Ubuntu 24.04 工具链，仍动态依赖 glibc。另已完成无需修改 workerd/V8 源码的静态 PIE 验证，详情见 [静态链接验证](docs/static-linking.md)；该实验尚未接入正式 Release 构建。
 
+下载适合机器架构的 Release 附件：
+
 ```sh
-tar -xzf workerd-1.20260916.1-krun.0-linux-x86_64.tar.gz
-cd workerd-1.20260916.1-krun.0-linux-x86_64
+# x86_64；ARM64 请将文件名替换为 workerd-linux-arm64.gz。
+gzip -dc workerd-linux-64.gz > workerd
+chmod +x workerd
 WORKERD_EXPERIMENTAL_CPU_MS=50 \
 WORKERD_EXPERIMENTAL_CPU_POLL_MS=10 \
 ./workerd serve /path/to/config.capnp
 ```
 
-也可只下载 Release 的 `workerd-linux-64.gz`，执行 `gzip -dc workerd-linux-64.gz > workerd && chmod +x workerd`。该文件的版本由所在的 Release tag 标识，校验值包含在同一 Release 的 `.sha256` 文件内。
+版本由所在的 Release tag 标识；GitHub 在附件信息中显示该 `.gz` 文件的 SHA256。需要完整元数据、校验文件或包含许可证/补丁的发行包时，从对应 Actions 构建的 artifact 下载。
 
 - `WORKERD_EXPERIMENTAL_CPU_MS`：每请求执行线程 CPU 预算，毫秒，默认 0（关闭）。
 - `WORKERD_EXPERIMENTAL_CPU_POLL_MS`：检查间隔，默认 10 ms，整数 1～100。

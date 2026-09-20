@@ -3,6 +3,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish VERSION after both Linux builds and tests pass'
+        type: boolean
+        default: false
   push:
     tags: ['v*-krun.*']
 permissions:
@@ -12,13 +17,25 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    runs-on: ${{ vars.WORKERD_RUNNER || 'ubuntu-24.04' }}
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.arch == 'x86_64' && vars.WORKERD_RUNNER_X64 || matrix.arch == 'arm64' && vars.WORKERD_RUNNER_ARM64 || matrix.runner }}
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
           persist-credentials: false
+      - id: version
+        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
       - name: Fetch pinned upstream release tag
         run: |
           upstream_tag="v$(cut -d- -f1 VERSION)"
@@ -28,17 +45,23 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: test "$RELEASE_TAG" = "v$(cat VERSION)"
+      - name: Make room on GitHub-hosted runners
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc
+          docker image prune -af
+          df -h .
       - name: Build, test and package
         env:
-          WORKERD_BUILD_JOBS: ${{ vars.WORKERD_BUILD_JOBS || '2' }}
-          WORKERD_BUILD_MEMORY_MB: ${{ vars.WORKERD_BUILD_MEMORY_MB || '6000' }}
+          WORKERD_BUILD_JOBS: ${{ vars.WORKERD_BUILD_JOBS || '3' }}
+          WORKERD_BUILD_MEMORY_MB: ${{ vars.WORKERD_BUILD_MEMORY_MB || '10000' }}
           DISTRO_CACHE: ${{ vars.WORKERD_BUILD_CACHE }}
         run: |
-          if [ -n "$DISTRO_CACHE" ]; then export WORKERD_BUILD_CACHE="$DISTRO_CACHE"; fi
+          if [ -n "$DISTRO_CACHE" ]; then export WORKERD_BUILD_CACHE="$DISTRO_CACHE/$(uname -m)"; fi
           python3 scripts/distro.py release
       - uses: actions/upload-artifact@v7
         with:
-          name: workerd-linux-x86_64
+          name: workerd-linux-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
           retention-days: 14
@@ -46,12 +69,12 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: failure-diagnostics
+          name: failure-diagnostics-${{ matrix.arch }}
           path: .build/test-run/*.log
           include-hidden-files: true
           if-no-files-found: ignore
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish)
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -59,20 +82,26 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: workerd-linux-x86_64
+          pattern: workerd-linux-*
+          merge-multiple: true
           path: dist
       - name: Publish verified assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: v${{ needs.build.outputs.version }}
         run: |
           cd dist
           sha256sum -c *.sha256
+          test -s workerd-linux-64.gz
+          test -s workerd-linux-arm64.gz
+          if tag_sha="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha 2>/dev/null)"; then
+            test "$tag_sha" = "$GITHUB_SHA"
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             # A user may have published the Release before the binary was built.
             # Keep its title, notes and prerelease status; retries replace our assets.
-            gh release upload "$RELEASE_TAG" ./* --clobber
+            gh release upload "$RELEASE_TAG" workerd-linux-64.gz workerd-linux-arm64.gz --clobber
           else
-            gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "$RELEASE_TAG" ./*
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --generate-notes --title "$RELEASE_TAG" workerd-linux-64.gz workerd-linux-arm64.gz
           fi
