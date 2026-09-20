@@ -90,6 +90,20 @@ python3 scripts/distro.py prepare
 
 补丁冲突会立即失败，不会静默跳过。解决方式是在导出的临时源码中适配修改，重新生成相对目标上游的补丁，再运行 prepare。更新 `VERSION`，提交 gitlink、补丁和版本后再 release。无需维护一套 V8 分支。
 
+修改自己的补丁时，可在独立 worktree 中编辑正常的 C++ 文件，避免手工维护 diff 的行号。以下命令在发行仓库根目录运行，适用于当前单补丁布局：
+
+```sh
+mkdir -p .build
+git -C upstream/workerd worktree add --detach ../../.build/edit-workerd HEAD
+git -C .build/edit-workerd apply ../../patches/0001-request-cpu-budget.patch
+# 在 .build/edit-workerd 中修改代码；升级上游导致 apply 失败时，先手工适配修改。
+git -C .build/edit-workerd add -N src/workerd/server/experimental-cpu-limit.h
+git -C .build/edit-workerd diff --binary > patches/0001-request-cpu-budget.patch
+python3 scripts/distro.py prepare
+```
+
+补丁保存并检查后，提交发行仓库里的补丁和版本变更，再构建。临时 worktree 不属于发行仓库提交内容，上游主工作区也不会被改脏。若引入多个补丁，应逐个维护并按 `patches/series` 顺序验证。
+
 ## 使用
 
 ```sh
