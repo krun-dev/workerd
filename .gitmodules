@@ -1,0 +1,3 @@
+[submodule "upstream/workerd"]
+	path = upstream/workerd
+	url = https://github.com/cloudflare/workerd.git

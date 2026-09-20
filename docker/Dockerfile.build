@@ -1,0 +1,11 @@
+FROM ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    clang-19 libc++-19-dev libc++abi-19-dev lld-19 clang-format-19 \
+    python3 tcl git curl ca-certificates xz-utils unzip patch pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fL https://releases.bazel.build/9.2.0/release/bazel-9.2.0-linux-x86_64 \
+    -o /usr/local/bin/bazel \
+    && echo '7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694  /usr/local/bin/bazel' | sha256sum -c - \
+    && chmod +x /usr/local/bin/bazel \
+    && ln -s /usr/bin/clang-19 /usr/local/bin/clang
+WORKDIR /work

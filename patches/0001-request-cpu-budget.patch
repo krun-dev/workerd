@@ -1,0 +1,344 @@
+diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
+index 79f727d..6bf6c56 100644
+--- a/src/workerd/server/BUILD.bazel
++++ b/src/workerd/server/BUILD.bazel
+@@ -222,6 +222,7 @@ wd_cc_library(
+         "server.c++",
+     ],
+     hdrs = [
++        "experimental-cpu-limit.h",
+         "server.h",
+     ],
+     deps = [
+diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
+index 4f8bbda..512b90f 100644
+--- a/src/workerd/server/server.c++
++++ b/src/workerd/server/server.c++
+@@ -6,6 +6,7 @@
+ 
+ #include "alarm-scheduler.h"
+ #include "container-client.h"
++#include "experimental-cpu-limit.h"
+ #include "pyodide.h"
+ #include "workerd-api.h"
+ 
+@@ -3301,8 +3302,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   }
+ 
+   kj::Own<void> enterStartupJs(
+-      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++#if __linux__
++    return enterExperimentalStartupCpu(lock, result);
++#else
+     return {};
++#endif
+   }
+ 
+   kj::Own<void> enterStartupPython(
+@@ -3311,8 +3316,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   }
+ 
+   kj::Own<void> enterDynamicImportJs(
+-      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++#if __linux__
++    return enterExperimentalStartupCpu(lock, result);
++#else
+     return {};
++#endif
+   }
+ 
+   kj::Own<void> enterLoggingJs(
+@@ -3964,10 +3973,13 @@ class Server::WorkerService final: public Service,
+       }
+     }
+ 
++    auto requestLimits = kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this));
++#if __linux__
++    requestLimits =
++        wrapExperimentalCpuLimiter(kj::mv(requestLimits), serviceName.orDefault("<dynamic>"));
++#endif
+     return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
+-        kj::mv(props), kj::mv(actor),
+-        kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
+-        {},  // ioContextDependency
++        kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},  // ioContextDependency
+         addRefToThis(), kj::mv(observer), waitUntilTasks,
+         true,                  // tunnelExceptions
+         kj::mv(workerTracer),  // workerTracer
+diff --git a/src/workerd/server/experimental-cpu-limit.h b/src/workerd/server/experimental-cpu-limit.h
+new file mode 100644
+index 0000000..b4b6d36
+--- /dev/null
++++ b/src/workerd/server/experimental-cpu-limit.h
+@@ -0,0 +1,269 @@
++// Experimental Linux-only host limiter. No V8 or workerd core changes.
++#pragma once
++
++#if __linux__
++#include <workerd/io/limit-enforcer.h>
++#include <workerd/jsg/jsg.h>
++#include <workerd/util/exception.h>
++
++#include <pthread.h>
++#include <time.h>
++
++#include <kj/thread.h>
++
++#include <atomic>
++#include <cstdlib>
++
++namespace workerd::server {
++
++inline uint64_t experimentalCpuBudgetNs(const char* variable, uint64_t fallbackMs = 0) {
++  const char* value = getenv(variable);
++  if (value == nullptr) return fallbackMs * 1000000;
++  auto ms = kj::StringPtr(value).parseAs<uint64_t>();
++  KJ_REQUIRE(ms <= 3600000, "experimental CPU budget must be <= one hour");
++  return ms * 1000000;
++}
++
++inline kj::Exception cpuBudgetException() {
++  auto error = KJ_EXCEPTION(OVERLOADED, "Worker exceeded experimental CPU budget");
++  error.setDetail(CPU_LIMIT_DETAIL_ID, kj::heapArray<kj::byte>(0));
++  return error;
++}
++
++struct CpuBudget {
++  explicit CpuBudget(uint64_t limitNs): limitNs(limitNs) {}
++  uint64_t limitNs;
++  uint64_t usedNs = 0;  // Only accessed under the watchdog mutex, or outside any active scope.
++  std::atomic<bool> exceeded{false};
++};
++
++// One watchdog per execution thread, NOT per request/isolate. It reads that execution thread's
++// CPU clock. Idle I/O time and other OS threads' CPU time are excluded. The mutex protects the
++// target's lifetime through TerminateExecution(), and is never held while guest JS executes.
++class CpuWatchdog {
++ public:
++  struct Frame {
++    CpuBudget& budget;
++    v8::Isolate* isolate;
++    Frame* previous = nullptr;
++    uint64_t startedNs = 0;
++  };
++
++  CpuWatchdog() {
++    KJ_REQUIRE(pollNs > 0 && pollNs <= 100000000, "watchdog interval must be 1..100 ms");
++    KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &clock) == 0);
++    thread = kj::heap<kj::Thread>([this]() { run(); });
++  }
++  ~CpuWatchdog() noexcept(false) {
++    pthread_mutex_lock(&mutex);
++    stopping = true;
++    pthread_cond_signal(&changed);
++    pthread_mutex_unlock(&mutex);
++    thread = nullptr;  // Joins before destroying the mutex or clock owner.
++    pthread_cond_destroy(&changed);
++    pthread_mutex_destroy(&mutex);
++  }
++
++  static CpuWatchdog& current() {
++    static thread_local CpuWatchdog watchdog;
++    return watchdog;
++  }
++
++  void enter(Frame& frame) {
++    pthread_mutex_lock(&mutex);
++    auto now = cpuNow();
++    if (active != nullptr) account(*active, now);
++    frame.previous = active;
++    frame.startedNs = now;
++    active = &frame;
++    if (frame.budget.exceeded.load()) frame.isolate->TerminateExecution();
++    pthread_cond_signal(&changed);
++    pthread_mutex_unlock(&mutex);
++  }
++
++  void leave(Frame& frame) {
++    pthread_mutex_lock(&mutex);
++    KJ_ASSERT(active == &frame);
++    auto now = cpuNow();
++    account(frame, now);
++    active = frame.previous;
++    if (active != nullptr) active->startedNs = now;
++    pthread_mutex_unlock(&mutex);
++  }
++
++ private:
++  pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
++  pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
++  clockid_t clock;
++  const uint64_t pollNs = experimentalCpuBudgetNs("WORKERD_EXPERIMENTAL_CPU_POLL_MS", 10);
++  bool stopping = false;
++  Frame* active = nullptr;
++  kj::Own<kj::Thread> thread;
++
++  uint64_t cpuNow() {
++    timespec time;
++    KJ_REQUIRE(clock_gettime(clock, &time) == 0);
++    return uint64_t(time.tv_sec) * 1000000000 + time.tv_nsec;
++  }
++
++  void account(Frame& frame, uint64_t now) {
++    frame.budget.usedNs += now - frame.startedNs;
++    frame.startedNs = now;
++    if (frame.budget.usedNs >= frame.budget.limitNs) frame.budget.exceeded.store(true);
++  }
++
++  void run() {
++    pthread_setname_np(pthread_self(), "workerd-cpu-wd");
++    for (;;) {
++      pthread_mutex_lock(&mutex);
++      while (active == nullptr && !stopping) pthread_cond_wait(&changed, &mutex);
++      if (stopping) {
++        pthread_mutex_unlock(&mutex);
++        return;
++      }
++      auto& frame = *active;
++      if (frame.budget.usedNs + cpuNow() - frame.startedNs >= frame.budget.limitNs) {
++        frame.budget.exceeded.store(true);
++        // A documented thread-safe V8 API. This is an ordinary thread, not a signal handler.
++        frame.isolate->TerminateExecution();
++      }
++      pthread_mutex_unlock(&mutex);
++      timespec delay{0, long(pollNs)};  // Configurable polling; not a hard real-time guarantee.
++      nanosleep(&delay, nullptr);
++    }
++  }
++};
++
++class CpuScope {
++ public:
++  CpuScope(CpuBudget& budget, v8::Isolate* isolate, kj::Function<void()> onExit)
++      : frame{budget, isolate},
++        onExit(kj::mv(onExit)) {
++    CpuWatchdog::current().enter(frame);
++  }
++  ~CpuScope() noexcept(false) {
++    CpuWatchdog::current().leave(frame);
++    onExit();  // Promise operations/logging stay on the execution thread.
++  }
++
++ private:
++  CpuWatchdog::Frame frame;
++  kj::Function<void()> onExit;
++};
++
++class StartupCpuScope {
++ public:
++  StartupCpuScope(jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result, uint64_t limitNs)
++      : budget(limitNs),
++        scope(budget, lock.v8Isolate, [&]() {
++          if (budget.exceeded.load())
++            result = cpuBudgetException();
++          else
++            result = int64_t(budget.usedNs) * kj::NANOSECONDS;
++        }) {}
++
++ private:
++  CpuBudget budget;
++  CpuScope scope;
++};
++
++inline kj::Own<void> enterExperimentalStartupCpu(
++    jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) {
++  if (experimentalCpuBudgetNs("WORKERD_EXPERIMENTAL_CPU_MS") == 0) return {};
++  auto limit = experimentalCpuBudgetNs("WORKERD_EXPERIMENTAL_STARTUP_CPU_MS", 1000);
++  KJ_REQUIRE(limit > 0);
++  return kj::heap<StartupCpuScope>(lock, result, limit);
++}
++
++// Own one of these per IoContext instead of storing counters on WorkerService (which is shared
++// by all requests). Everything except CPU enforcement delegates to the existing host policy.
++class RequestCpuLimiter final: public LimitEnforcer {
++ public:
++  RequestCpuLimiter(kj::Own<LimitEnforcer> inner, uint64_t limitNs, kj::StringPtr workerName)
++      : inner(kj::mv(inner)),
++        budget(limitNs),
++        workerName(kj::str(workerName)) {
++    auto pair = kj::newPromiseAndFulfiller<void>();
++    exceededPromise = pair.promise.fork();
++    fulfiller = kj::mv(pair.fulfiller);
++  }
++
++  kj::Own<void> enterJs(jsg::Lock& lock, IoContext&) override {
++    requireLimitsNotExceeded();
++    return kj::heap<CpuScope>(budget, lock.v8Isolate, [this]() { reportExceeded(); });
++  }
++  kj::Maybe<EventOutcome> getLimitsExceeded() override {
++    if (budget.exceeded.load()) return EventOutcome::EXCEEDED_CPU;
++    return inner->getLimitsExceeded();
++  }
++  kj::Promise<void> onLimitsExceeded() override {
++    return exceededPromise.addBranch().exclusiveJoin(inner->onLimitsExceeded());
++  }
++  void requireLimitsNotExceeded() override {
++    if (budget.exceeded.load()) kj::throwFatalException(cpuBudgetException());
++    inner->requireLimitsNotExceeded();
++  }
++  void topUpActor() override {
++    inner->topUpActor();
++    if (!budget.exceeded.load()) budget.usedNs = 0;
++  }
++  void newSubrequest(bool inHouse) override {
++    inner->newSubrequest(inHouse);
++  }
++  void newKvRequest(KvOpType op) override {
++    inner->newKvRequest(op);
++  }
++  void newAnalyticsEngineRequest() override {
++    inner->newAnalyticsEngineRequest();
++  }
++  kj::Promise<void> limitDrain() override {
++    return inner->limitDrain();
++  }
++  kj::Promise<void> limitScheduled() override {
++    return inner->limitScheduled();
++  }
++  kj::Duration getAlarmLimit() override {
++    return inner->getAlarmLimit();
++  }
++  size_t getBufferingLimit() override {
++    return inner->getBufferingLimit();
++  }
++  void setCpuLimitNearlyExceededCallback(kj::Function<void()> cb) override {
++    inner->setCpuLimitNearlyExceededCallback(kj::mv(cb));
++  }
++  void reportMetrics(RequestObserver& observer) override {
++    inner->reportMetrics(observer);
++  }
++  kj::Duration consumeTimeElapsedForPeriodicLogging() override {
++    return 0 * kj::SECONDS;
++  }
++  size_t getSqliteMemoryUsage() const override {
++    return inner->getSqliteMemoryUsage();
++  }
++
++ private:
++  void reportExceeded() {
++    if (budget.exceeded.load() && !reported) {
++      reported = true;
++      KJ_LOG(WARNING, "experimental CPU limit", workerName, budget.limitNs, budget.usedNs);
++      fulfiller->reject(cpuBudgetException());
++    }
++  }
++
++  kj::Own<LimitEnforcer> inner;
++  CpuBudget budget;
++  kj::String workerName;
++  bool reported = false;
++  kj::ForkedPromise<void> exceededPromise = nullptr;
++  kj::Own<kj::PromiseFulfiller<void>> fulfiller;
++};
++
++inline kj::Own<LimitEnforcer> wrapExperimentalCpuLimiter(
++    kj::Own<LimitEnforcer> inner, kj::StringPtr workerName) {
++  auto limit = experimentalCpuBudgetNs("WORKERD_EXPERIMENTAL_CPU_MS");
++  if (limit == 0) return inner;
++  return kj::heap<RequestCpuLimiter>(kj::mv(inner), limit, workerName);
++}
++
++}  // namespace workerd::server
++#endif

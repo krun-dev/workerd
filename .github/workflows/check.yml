@@ -1,0 +1,18 @@
+name: Check patches
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - run: python3 -m py_compile scripts/distro.py tests/integration.py
+      - run: python3 scripts/distro.py prepare
+      - run: git diff --exit-code && test -z "$(git -C upstream/workerd status --porcelain)"

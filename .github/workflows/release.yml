@@ -1,0 +1,65 @@
+name: Build and release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*-cpu.*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ${{ vars.WORKERD_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Validate tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: test "$RELEASE_TAG" = "v$(cat VERSION)"
+      - name: Build, test and package
+        env:
+          WORKERD_BUILD_JOBS: ${{ vars.WORKERD_BUILD_JOBS || '2' }}
+          WORKERD_BUILD_MEMORY_MB: ${{ vars.WORKERD_BUILD_MEMORY_MB || '6000' }}
+          DISTRO_CACHE: ${{ vars.WORKERD_BUILD_CACHE }}
+        run: |
+          if [ -n "$DISTRO_CACHE" ]; then export WORKERD_BUILD_CACHE="$DISTRO_CACHE"; fi
+          python3 scripts/distro.py release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workerd-cpu-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-diagnostics
+          path: .build/test-run/*.log
+          if-no-files-found: ignore
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: workerd-cpu-linux-x86_64
+          path: dist
+      - name: Publish verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum -c *.sha256
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "workerd CPU budget $RELEASE_TAG" ./*
