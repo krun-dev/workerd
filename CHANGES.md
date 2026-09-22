@@ -1,5 +1,11 @@
 # Distribution changes
 
+## Unreleased
+
+- Add an opt-in per-isolate memory budget for ordinary JavaScript HTTP Workers. Stop admitting requests to an exceeded isolate, allow in-flight work a configurable grace period, then release it. Subsequent requests share one lazy reload; forced failures return HTTP 503.
+- Keep memory-limited Durable Objects and CustomEvent/RPC disabled until their longer-lived references can be revoked safely. The budget covers V8-reported heap and external memory, not a hard process RSS limit.
+- Add real-binary cleanup tests to the Linux AMD64 release gate. V8 source remains unchanged.
+
 ## 1.20260920.1-krun.0
 
 - Upgrade the pinned official release to v1.20260920.1 (90faec3319d87b3ca98f8f522a1cc4295538d5ef). The CPU budget patch applies unchanged.

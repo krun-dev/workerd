@@ -64,7 +64,8 @@ def inputs():
         patches.append({'file': name, 'sha256': sha(ROOT / 'patches' / name)})
     if not patches:
         raise RuntimeError('Empty patch series.')
-    files = ['scripts/distro.py', 'scripts/versioning.py', 'docker/Dockerfile.build', 'tests/integration.py']
+    files = ['scripts/distro.py', 'scripts/versioning.py', 'docker/Dockerfile.build',
+             'tests/integration.py', 'tests/memory_integration.py']
     files += [str(p.relative_to(ROOT)) for p in sorted((ROOT / 'tests/fixtures').iterdir()) if p.is_file()]
     return {'version': version, 'upstream_version': upstream_version,
             'upstream_commit': commit, 'patches': patches,
@@ -177,6 +178,7 @@ def test(binary=None):
         shutil.rmtree(directory)
     shutil.copytree(ROOT / 'tests/fixtures', directory)
     shutil.copy2(ROOT / 'tests/integration.py', directory / 'integration.py')
+    shutil.copy2(ROOT / 'tests/memory_integration.py', directory / 'memory_integration.py')
     (BUILD / 'test.json').unlink(missing_ok=True)
     env = os.environ.copy()
     for key in list(env):
@@ -188,8 +190,13 @@ def test(binary=None):
     results = json.loads((directory / 'results.json').read_text())
     if len(results['checks']) != 14 or not all(results['checks'].values()):
         raise RuntimeError('CPU budget integration checks failed.')
+    run([sys.executable, directory / 'memory_integration.py', binary], env=env)
+    memory = json.loads((directory / 'memory-results.json').read_text())
+    if len(memory['checks']) != 24 or not all(memory['checks'].values()):
+        raise RuntimeError('Memory budget integration checks failed.')
     write_json(BUILD / 'test.json', {'binary_sha256': sha(binary), 'inputs': inputs(),
-                                   'checks': results['checks'], 'kernel': platform.release()})
+                                   'checks': results['checks'], 'memory_checks': memory['checks'],
+                                   'kernel': platform.release()})
 
 
 def package():

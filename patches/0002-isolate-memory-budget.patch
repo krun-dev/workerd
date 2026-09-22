@@ -1,0 +1,770 @@
+diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
+index 19dbb4c..0828684 100644
+--- a/src/workerd/server/BUILD.bazel
++++ b/src/workerd/server/BUILD.bazel
+@@ -275,6 +275,7 @@ wd_cc_library(
+     ],
+     hdrs = [
+         "experimental-cpu-limit.h",
++        "experimental-memory-limit.h",
+         "server.h",
+     ],
+     deps = [
+diff --git a/src/workerd/server/experimental-memory-limit.h b/src/workerd/server/experimental-memory-limit.h
+new file mode 100644
+index 0000000..d8e4f05
+--- /dev/null
++++ b/src/workerd/server/experimental-memory-limit.h
+@@ -0,0 +1,407 @@
++#pragma once
++
++#include <workerd/io/limit-enforcer.h>
++#include <workerd/io/worker-interface.h>
++#include <workerd/jsg/setup.h>
++#include <workerd/util/exception.h>
++
++#include <kj/async.h>
++#include <kj/list.h>
++#include <kj/thread.h>
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <mutex>
++
++namespace workerd::server {
++
++inline kj::Exception memoryBudgetException() {
++  auto e = KJ_EXCEPTION(OVERLOADED, "Worker exceeded experimental memory budget; worker stopped");
++  e.setDetail(MEMORY_LIMIT_DETAIL_ID, kj::heapArray<kj::byte>(0));
++  return e;
++}
++
++// One generation's budget. All state belongs to the event-loop thread except `stopped`
++// and the watchdog cancellation flag. Retiring forbids new work; stopped forbids all JS.
++class ExperimentalMemoryBudget final: public kj::Refcounted {
++ public:
++  struct Entry {
++    virtual void release() = 0;
++    kj::ListLink<Entry> link;
++    bool linked = false;
++  };
++  explicit ExperimentalMemoryBudget(kj::StringPtr name): name(kj::str(name)) {
++    auto value = std::getenv("WORKERD_EXPERIMENTAL_MEMORY_MB");
++    if (value != nullptr) {
++      char* end;
++      auto mb = std::strtoull(value, &end, 10);
++      KJ_REQUIRE(*value != '\0' && *end == '\0' && (mb == 0 || (mb >= 16 && mb <= 2048)),
++          "WORKERD_EXPERIMENTAL_MEMORY_MB must be 0 or 16..2048");
++      limit = mb * 1024 * 1024;
++    }
++    if (enabled()) {
++      if (auto value = std::getenv("WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS")) {
++        char* end;
++        graceMs = std::strtoull(value, &end, 10);
++        KJ_REQUIRE(*value != '\0' && *end == '\0' && graceMs <= 60000,
++            "WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS must be 0..60000");
++      }
++    }
++    auto retired = kj::newPromiseAndFulfiller<void>();
++    retiredPromise = retired.promise.fork();
++    retiredFulfiller = kj::mv(retired.fulfiller);
++    auto stopped = kj::newPromiseAndFulfiller<void>();
++    stoppedPromise = stopped.promise.fork();
++    stoppedFulfiller = kj::mv(stopped.fulfiller);
++    auto idle = kj::newPromiseAndFulfiller<void>();
++    idlePromise = idle.promise.fork();
++    idleFulfiller = kj::mv(idle.fulfiller);
++  }
++  ~ExperimentalMemoryBudget() noexcept(false) {
++    disarmWatchdog();
++  }
++
++  bool enabled() const {
++    return limit != 0;
++  }
++  bool exceeded() const {
++    return stopped.load();
++  }
++  bool isRetiring() const {
++    return retiring;
++  }
++  void startServing() {
++    serving = true;
++  }
++  size_t getLimit() const {
++    return limit;
++  }
++  kj::Promise<void> onRetired() {
++    return retiredPromise.addBranch();
++  }
++  kj::Promise<void> onStopped() {
++    return stoppedPromise.addBranch();
++  }
++  kj::Promise<void> onIdle() {
++    return idlePromise.addBranch();
++  }
++  kj::Duration remainingGrace() const {
++    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
++        deadline - std::chrono::steady_clock::now())
++                         .count();
++    return kj::max(int64_t(0), remaining) * kj::MILLISECONDS;
++  }
++
++  void add(Entry& e) {
++    entries.add(e);
++    e.linked = true;
++  }
++  void remove(Entry& e) {
++    if (e.linked) {
++      entries.remove(e);
++      e.linked = false;
++    }
++  }
++  void beginRequest() {
++    ++requests;
++  }
++  void endRequest() {
++    --requests;
++    notifyIdle();
++  }
++  // Connections do not necessarily retain the request promise. Conservatively allow the full
++  // grace period for a generation that has accepted one, then use upstream revocation.
++  void hasConnection() {
++    connectionSeen = true;
++  }
++  void revokeAll() {
++    disarmWatchdog();
++    stopped.store(true);
++    publish();
++    canceler.cancel(memoryBudgetException());
++    while (!entries.empty()) {
++      auto& e = entries.front();
++      remove(e);
++      e.release();
++    }
++  }
++  kj::Canceler canceler;
++
++  void configure(v8::Isolate::CreateParams& params) {
++    if (enabled()) params.constraints.ConfigureDefaultsFromHeapSize(0, limit + HEADROOM);
++  }
++  void install(v8::Isolate* isolate) {
++    if (!enabled()) return;
++    this->isolate = isolate;
++    isolate->AddNearHeapLimitCallback(nearLimit, this);
++    isolate->AddGCEpilogueCallback(afterGc, this);
++  }
++  void check(v8::Isolate* isolate, bool terminate = false) {
++    if (!enabled()) return;
++    v8::HeapStatistics stats;
++    isolate->GetHeapStatistics(&stats);
++    // Registered external memory includes ArrayBuffer backing stores, not all native memory.
++    auto used = stats.used_heap_size() + stats.external_memory();
++    if (used > limit) retire();
++    if (used > limit + HEADROOM) stopped.store(true);
++    if (exceeded() && terminate) isolate->TerminateExecution();
++  }
++
++  // KJ notifications are only published after V8 execution, never inside a GC callback.
++  void publish() {
++    if (retiring && !retiredPublished) {
++      retiredPublished = true;
++      KJ_LOG(WARNING, "experimental memory limit: retiring worker", name, limit, graceMs);
++      retiredFulfiller->fulfill();
++      notifyIdle();
++    }
++    if (exceeded() && !stoppedPublished) {
++      stoppedPublished = true;
++      KJ_LOG(WARNING, "experimental memory limit: stopping worker", name, limit);
++      stoppedFulfiller->reject(memoryBudgetException());
++    }
++  }
++  void beforeResponse() {
++    if (isolate != nullptr && v8::Isolate::GetCurrent() == isolate) check(isolate);
++  }
++  void disarmWatchdog() {
++    {
++      std::lock_guard lock(watchdogMutex);
++      watchdogCanceled = true;
++    }
++    watchdogChanged.notify_one();
++    watchdog = nullptr;  // Join before any path can destroy the V8 isolate.
++  }
++  void disposed() {
++    isolate = nullptr;
++    if (retiring) KJ_LOG(WARNING, "experimental memory limit: isolate disposed", name);
++  }
++
++ private:
++  void notifyIdle() {
++    if (retiredPublished && requests == 0 && !connectionSeen && !idlePublished) {
++      idlePublished = true;
++      idleFulfiller->fulfill();
++    }
++  }
++  void retire() {
++    if (retiring) return;
++    retiring = true;
++    deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(graceMs);
++    if (!serving || graceMs == 0) {
++      stopped.store(true);
++      return;
++    }
++    // Only retired generations need a thread. A KJ timer alone cannot interrupt synchronous
++    // JS that blocks the event loop. This thread performs no KJ promise operations or logging.
++    watchdog = kj::heap<kj::Thread>([this]() {
++      std::unique_lock lock(watchdogMutex);
++      if (!watchdogChanged.wait_until(lock, deadline, [this]() { return watchdogCanceled; })) {
++        stopped.store(true);
++        isolate->TerminateExecution();
++      }
++    });
++  }
++  static void afterGc(v8::Isolate* isolate, v8::GCType, v8::GCCallbackFlags, void* data) {
++    static_cast<ExperimentalMemoryBudget*>(data)->check(isolate, true);
++  }
++  static size_t nearLimit(void* data, size_t current, size_t) {
++    auto& self = *static_cast<ExperimentalMemoryBudget*>(data);
++    self.retire();
++    self.stopped.store(true);
++    v8::Isolate::GetCurrent()->TerminateExecution();
++    return current + HEADROOM;
++  }
++
++  static constexpr size_t HEADROOM = 16 * 1024 * 1024;
++  kj::List<Entry, &Entry::link> entries;
++  kj::String name;
++  v8::Isolate* isolate = nullptr;
++  size_t limit = 0;
++  uint64_t graceMs = 5000;
++  uint requests = 0;
++  bool serving = false;
++  bool retiring = false;
++  bool connectionSeen = false;
++  bool retiredPublished = false;
++  bool stoppedPublished = false;
++  bool idlePublished = false;
++  std::atomic<bool> stopped{false};
++  std::chrono::steady_clock::time_point deadline;
++  std::mutex watchdogMutex;
++  std::condition_variable watchdogChanged;
++  bool watchdogCanceled = false;
++  kj::Own<kj::Thread> watchdog;
++  kj::ForkedPromise<void> retiredPromise = nullptr;
++  kj::Own<kj::PromiseFulfiller<void>> retiredFulfiller;
++  kj::ForkedPromise<void> stoppedPromise = nullptr;
++  kj::Own<kj::PromiseFulfiller<void>> stoppedFulfiller;
++  kj::ForkedPromise<void> idlePromise = nullptr;
++  kj::Own<kj::PromiseFulfiller<void>> idleFulfiller;
++};
++
++// Startup/import have their own error channel; report memory termination before the caller
++// tries to turn a terminated V8 TryCatch into a JavaScript exception.
++class MemoryStartupScope {
++ public:
++  MemoryStartupScope(ExperimentalMemoryBudget& budget,
++      jsg::Lock& lock,
++      kj::OneOf<kj::Exception, kj::Duration>& result,
++      kj::Own<void> inner)
++      : budget(budget),
++        isolate(lock.v8Isolate),
++        result(result),
++        inner(kj::mv(inner)) {}
++  ~MemoryStartupScope() noexcept(false) {
++    inner = nullptr;
++    budget.check(isolate);
++    budget.publish();
++    if (budget.exceeded()) result = memoryBudgetException();
++  }
++
++ private:
++  ExperimentalMemoryBudget& budget;
++  v8::Isolate* isolate;
++  kj::OneOf<kj::Exception, kj::Duration>& result;
++  kj::Own<void> inner;
++};
++
++// Own and revoke the entrypoint, not just the promise returned by fetch(). In particular, an
++// uninvoked entrypoint must not pin an IoContext and its isolate after the worker is stopped.
++class MemoryLimitedWorkerInterface final: public WorkerInterface,
++                                          private ExperimentalMemoryBudget::Entry {
++ public:
++  MemoryLimitedWorkerInterface(kj::Own<WorkerInterface> inner,
++      kj::Own<ExperimentalMemoryBudget> budget,
++      const kj::HttpHeaderTable& headerTable)
++      : budget(kj::mv(budget)),
++        inner(kj::mv(inner)),
++        headerTable(headerTable) {
++    this->budget->add(*this);
++  }
++  ~MemoryLimitedWorkerInterface() noexcept(false) {
++    budget->remove(*this);
++  }
++  void release() override {
++    inner = nullptr;
++  }
++
++  kj::Promise<void> request(kj::HttpMethod method,
++      kj::StringPtr url,
++      const kj::HttpHeaders& headers,
++      kj::AsyncInputStream& body,
++      Response& response) override {
++    budget->beginRequest();
++    KJ_DEFER(budget->endRequest());
++    ResponseTracker tracker(response, *budget);
++    KJ_TRY {
++      requireLive();
++      co_await budget->canceler.wrap(inner->request(method, url, headers, body, tracker));
++    }
++    KJ_CATCH(e) {
++      if (!budget->exceeded() || tracker.sent) kj::throwFatalException(kj::mv(e));
++      constexpr kj::StringPtr message = "Worker stopped: memory limit exceeded.\n"_kj;
++      kj::HttpHeaders out(headerTable);
++      out.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "text/plain; charset=utf-8");
++      auto stream = response.send(503, "Service Unavailable", out, message.size());
++      co_await stream->write(message.asBytes());
++    }
++  }
++
++  kj::Promise<void> connect(kj::StringPtr host,
++      const kj::HttpHeaders& headers,
++      kj::AsyncIoStream& connection,
++      ConnectResponse& response,
++      kj::HttpConnectSettings settings) override {
++    requireLive();
++    budget->hasConnection();
++    return budget->canceler.wrap(
++        inner->connect(host, headers, connection, response, kj::mv(settings)));
++  }
++  kj::Promise<void> prewarm(kj::StringPtr url) override {
++    requireLive();
++    return track(inner->prewarm(url));
++  }
++  kj::Promise<ScheduledResult> runScheduled(kj::Date time, kj::StringPtr cron) override {
++    requireLive();
++    return track(inner->runScheduled(time, cron));
++  }
++  kj::Promise<AlarmResult> runAlarm(kj::Date time, uint32_t retries) override {
++    requireLive();
++    return track(inner->runAlarm(time, retries));
++  }
++  kj::Promise<kj::Maybe<kj::Date>> abandonAlarm(kj::Date time) override {
++    requireLive();
++    return track(inner->abandonAlarm(time));
++  }
++  kj::Promise<bool> test() override {
++    requireLive();
++    return track(inner->test());
++  }
++  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
++    if (budget->exceeded()) {
++      auto e = memoryBudgetException();
++      event->failed(e);
++      return kj::mv(e);
++    }
++    // RPC can export capabilities that outlive this entrypoint and retain its IoContext.
++    // Until this budget integrates their lifetime, do not admit custom events in memory-limited mode.
++    return event->notSupported().attach(kj::mv(event));
++  }
++
++ private:
++  template <typename T>
++  kj::Promise<T> track(kj::Promise<T> promise) {
++    budget->beginRequest();
++    return budget->canceler.wrap(kj::mv(promise)).attach(kj::defer([state = kj::addRef(*budget)]() mutable {
++      state->endRequest();
++    }));
++  }
++
++  class ResponseTracker final: public Response {
++   public:
++    ResponseTracker(Response& inner, ExperimentalMemoryBudget& budget)
++        : inner(inner),
++          budget(budget) {}
++    kj::Own<kj::AsyncOutputStream> send(uint status,
++        kj::StringPtr text,
++        const kj::HttpHeaders& headers,
++        kj::Maybe<uint64_t> size) override {
++      budget.beforeResponse();
++      if (budget.exceeded()) kj::throwFatalException(memoryBudgetException());
++      sent = true;
++      return inner.send(status, text, headers, size);
++    }
++    kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
++      budget.beforeResponse();
++      if (budget.exceeded()) kj::throwFatalException(memoryBudgetException());
++      budget.hasConnection();
++      sent = true;
++      return inner.acceptWebSocket(headers);
++    }
++    bool sent = false;
++
++   private:
++    Response& inner;
++    ExperimentalMemoryBudget& budget;
++  };
++  void requireLive() {
++    if (budget->isRetiring()) kj::throwFatalException(memoryBudgetException());
++  }
++  kj::Own<ExperimentalMemoryBudget> budget;
++  kj::Own<WorkerInterface> inner;
++  const kj::HttpHeaderTable& headerTable;
++};
++
++inline kj::Own<WorkerInterface> wrapExperimentalMemoryInterface(kj::Own<WorkerInterface> inner,
++    ExperimentalMemoryBudget& budget,
++    const kj::HttpHeaderTable& headerTable) {
++  if (!budget.enabled()) return inner;
++  return kj::heap<MemoryLimitedWorkerInterface>(
++      newRevocableWebSocketWorkerInterface(kj::mv(inner), budget.onStopped()), kj::addRef(budget),
++      headerTable);
++}
++
++}  // namespace workerd::server
+diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
+index 3c2835e..df16dce 100644
+--- a/src/workerd/server/server.c++
++++ b/src/workerd/server/server.c++
+@@ -7,6 +7,7 @@
+ #include "alarm-scheduler.h"
+ #include "container-client.h"
+ #include "experimental-cpu-limit.h"
++#include "experimental-memory-limit.h"
+ #include "pyodide.h"
+ #include "workerd-api.h"
+ 
+@@ -3303,14 +3304,23 @@ class SequentialSpanSubmitter final: public SpanSubmitter {
+   kj::EntropySource& entropySource;
+ };
+ 
+-// IsolateLimitEnforcer that enforces no limits.
+-class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
++// Standalone server limits; experimental budgets are opt-in.
++class ServerIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  public:
++  explicit ServerIsolateLimitEnforcer(kj::Own<ExperimentalMemoryBudget> memory)
++      : memory(kj::mv(memory)) {}
++  ~ServerIsolateLimitEnforcer() noexcept(false) {
++    memory->disposed();
++  }
+   v8::Isolate::CreateParams getCreateParams() override {
+-    return {};
++    v8::Isolate::CreateParams params;
++    memory->configure(params);
++    return params;
+   }
+ 
+-  void customizeIsolate(v8::Isolate* isolate) override {}
++  void customizeIsolate(v8::Isolate* isolate) override {
++    memory->install(isolate);
++  }
+ 
+   ActorCacheSharedLruOptions getActorCacheLruOptions() override {
+     // TODO(someday): Make this configurable?
+@@ -3327,11 +3337,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ 
+   kj::Own<void> enterStartupJs(
+       jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++    kj::Own<void> cpu;
+ #if __linux__
+-    return enterExperimentalStartupCpu(lock, result);
+-#else
+-    return {};
++    cpu = enterExperimentalStartupCpu(lock, result);
+ #endif
++    if (!memory->enabled()) return cpu;
++    return kj::heap<MemoryStartupScope>(*memory, lock, result, kj::mv(cpu));
+   }
+ 
+   kj::Own<void> enterStartupPython(
+@@ -3341,11 +3352,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ 
+   kj::Own<void> enterDynamicImportJs(
+       jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++    kj::Own<void> cpu;
+ #if __linux__
+-    return enterExperimentalStartupCpu(lock, result);
+-#else
+-    return {};
++    cpu = enterExperimentalStartupCpu(lock, result);
+ #endif
++    if (!memory->enabled()) return cpu;
++    return kj::heap<MemoryStartupScope>(*memory, lock, result, kj::mv(cpu));
+   }
+ 
+   kj::Own<void> enterLoggingJs(
+@@ -3361,7 +3373,9 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   void completedRequest(kj::StringPtr id) const override {}
+ 
+   bool exitJs(jsg::Lock& lock) const override {
+-    return false;
++    memory->check(lock.v8Isolate);
++    memory->publish();
++    return memory->exceeded();
+   }
+ 
+   void reportMetrics(IsolateObserver& isolateMetrics) const override {}
+@@ -3372,7 +3386,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   }
+ 
+   bool hasExcessivelyExceededHeapLimit() const override {
+-    return false;
++    return memory->exceeded();
+   }
+ 
+   const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
+@@ -3380,6 +3394,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   }
+ 
+  private:
++  mutable kj::Own<ExperimentalMemoryBudget> memory;
+   TrackedWasmInstanceList trackedWasmInstances;
+ };
+ 
+@@ -3486,6 +3501,7 @@ class Server::WorkerService final: public Service,
+       ThreadContext& threadContext,
+       const kj::MonotonicClock& monotonicClock,
+       kj::Own<const Worker> worker,
++      kj::Own<ExperimentalMemoryBudget> memory,
+       kj::Maybe<kj::HashSet<kj::String>> defaultEntrypointHandlers,
+       kj::HashMap<kj::String, kj::HashSet<kj::String>> namedEntrypoints,
+       kj::HashSet<kj::String> actorClassEntrypointsParam,
+@@ -3502,6 +3518,7 @@ class Server::WorkerService final: public Service,
+         threadContext(threadContext),
+         monotonicClock(monotonicClock),
+         ioChannels(kj::mv(linkCallback)),
++        memory(kj::mv(memory)),
+         worker(kj::mv(worker)),
+         defaultEntrypointHandlers(kj::mv(defaultEntrypointHandlers)),
+         namedEntrypoints(kj::mv(namedEntrypoints)),
+@@ -3513,7 +3530,55 @@ class Server::WorkerService final: public Service,
+         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
+         isDynamic(isDynamic),
+         abortIsolateCallback(kj::mv(abortIsolateCallback)),
+-        accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
++        accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {
++    persistentSelfTokens = selfTokensArePersistent();
++    if (this->memory->enabled()) {
++      this->memory->startServing();
++      memoryCleanup = retireForMemory().fork();
++    }
++  }
++  ~WorkerService() noexcept(false) {
++    memory->disarmWatchdog();
++  }
++
++  using MemoryReload = kj::Function<kj::Promise<kj::Own<WorkerService>>()>;
++  void setMemoryReload(MemoryReload reload) {
++    if (memory->enabled()) memoryReload = kj::mv(reload);
++  }
++
++  // Owned by this service; the coroutine is canceled before its dependencies are destroyed.
++  kj::Promise<void> retireForMemory() {
++    co_await memory->onRetired();
++    if (!memory->exceeded()) {
++      auto drained = memory->onIdle().then([this]() { return waitUntilTasks.onEmpty(); });
++      co_await drained
++          .exclusiveJoin(threadContext.getUnsafeTimer().afterDelay(memory->remainingGrace()))
++          .exclusiveJoin(memory->onStopped().catch_([](kj::Exception&&) {}));
++    }
++    memory->revokeAll();
++    unlink();
++    worker = nullptr;
++  }
++
++  // The configured service is a stable routing address. It retains only the newest generation;
++  // retired generations never form a forwarding chain. Rebuilds share one promise.
++  kj::Promise<void> reloadAfterMemoryRetirement() {
++    KJ_DEFER(memoryReloadPending = false);
++    auto& generation = memoryReplacement.get() == nullptr ? *this : *memoryReplacement;
++    co_await generation.memoryCleanup.addBranch();
++    auto fresh = co_await KJ_ASSERT_NONNULL(memoryReload)();
++    fresh->memoryReload = kj::none;
++    memoryReplacement = kj::mv(fresh);
++  }
++
++  kj::Promise<void> ensureMemoryGeneration() {
++    if (!memoryReloadPending) {
++      memoryReloadPending = true;
++      memoryReloadTask = reloadAfterMemoryRetirement().fork();
++    }
++    // Do not reset the shared task while other callers still await their branches.
++    co_await memoryReloadTask.addBranch();
++  }
+ 
+   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
+   // the constructor itself since it sets up cyclic references, which will throw an exception if
+@@ -3677,6 +3742,7 @@ class Server::WorkerService final: public Service,
+   }
+ 
+   void unlink() override {
++    if (memoryReplacement.get() != nullptr) memoryReplacement->unlink();
+     // Need to remove all waited until tasks before destroying `ioChannels`
+     waitUntilTasks.clear();
+ 
+@@ -3718,6 +3784,7 @@ class Server::WorkerService final: public Service,
+   // Get whether self-tokens should be persistent, which is the case if the
+   // `allow_irrevocable_stub_storage` compat flag is set.
+   Persistent selfTokensArePersistent() {
++    if (worker.get() == nullptr) return persistentSelfTokens;
+     return Persistent(
+         worker->getIsolate().getApi().getFeatureFlags().getAllowIrrevocableStubStorage());
+   }
+@@ -3885,6 +3952,31 @@ class Server::WorkerService final: public Service,
+       kj::Maybe<kj::Own<Worker::Actor>> actor,
+       bool isTracer,
+       kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
++    if (memory->enabled()) {
++      auto& generation = memoryReplacement.get() == nullptr ? *this : *memoryReplacement;
++      if (generation.memory->isRetiring()) {
++        if (memoryReload == kj::none) {
++          return wrapExperimentalMemoryInterface(
++              WorkerInterface::fromException(memoryBudgetException()), *generation.memory,
++              threadContext.getHeaderTable());
++        }
++        // Own the service and entrypoint name while queued. Cancellation releases the waiter;
++        // the service-owned reload still completes for other requests.
++        auto name = entrypointName.map([](kj::StringPtr n) { return kj::str(n); });
++        return newPromisedWorkerInterface(ensureMemoryGeneration().then(
++            [self = kj::addRef(*this), metadata = kj::mv(metadata), name = kj::mv(name),
++                props = kj::mv(props), actor = kj::mv(actor), isTracer,
++                accessInfo = kj::mv(accessInfo)]() mutable {
++          return self->createEntrypoint(kj::mv(metadata),
++              name.map([](kj::String& n) -> kj::StringPtr { return n; }), kj::mv(props),
++              kj::mv(actor), isTracer, kj::mv(accessInfo));
++        }));
++      }
++      if (&generation != this) {
++        return generation.createEntrypoint(kj::mv(metadata), entrypointName, kj::mv(props),
++            kj::mv(actor), isTracer, kj::mv(accessInfo));
++      }
++    }
+     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
+ 
+     kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(channels.tails.size());
+@@ -4008,17 +4100,20 @@ class Server::WorkerService final: public Service,
+     requestLimits =
+         wrapExperimentalCpuLimiter(kj::mv(requestLimits), serviceName.orDefault("<dynamic>"));
+ #endif
+-    return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
+-        kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},  // ioContextDependency
+-        addRefToThis(), kj::mv(observer), waitUntilTasks,
+-        true,                  // tunnelExceptions
+-        kj::mv(workerTracer),  // workerTracer
+-        kj::mv(metadata.cfBlobJson),
+-        kj::none,  // versionInfo
+-        kj::mv(triggerContext),
+-        false,  // isDynamicDispatch
+-        kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
+-        kj::mv(metadata.clientAddress));
++    auto entrypoint =
++        newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
++            kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},  // ioContextDependency
++            addRefToThis(), kj::mv(observer), waitUntilTasks,
++            true,                  // tunnelExceptions
++            kj::mv(workerTracer),  // workerTracer
++            kj::mv(metadata.cfBlobJson),
++            kj::none,  // versionInfo
++            kj::mv(triggerContext),
++            false,  // isDynamicDispatch
++            kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory),
++            metadata.fromPersistentStub, kj::mv(metadata.clientAddress));
++    return wrapExperimentalMemoryInterface(
++        kj::mv(entrypoint), *memory, threadContext.getHeaderTable());
+   }
+ 
+  private:
+@@ -4253,7 +4348,9 @@ class Server::WorkerService final: public Service,
+   // LinkedIoChannels owns the SqliteDatabase::Vfs, so make sure it is destroyed last.
+   kj::OneOf<LinkCallback, LinkedIoChannels> ioChannels;
+ 
++  kj::Own<ExperimentalMemoryBudget> memory;
+   kj::Own<const Worker> worker;
++  Persistent persistentSelfTokens = Persistent::NO;
+   kj::Maybe<kj::HashSet<kj::String>> defaultEntrypointHandlers;
+   kj::HashMap<kj::String, kj::HashSet<kj::String>> namedEntrypoints;
+   kj::HashSet<kj::String> actorClassEntrypoints;
+@@ -4267,6 +4364,11 @@ class Server::WorkerService final: public Service,
+   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
+   kj::Maybe<kj::String> accessBlobHeaderName;
+   kj::Maybe<kj::uint> accessBindingServiceChannel;
++  kj::Maybe<MemoryReload> memoryReload;
++  kj::Own<WorkerService> memoryReplacement;
++  bool memoryReloadPending = false;
++  kj::ForkedPromise<void> memoryCleanup = nullptr;
++  kj::ForkedPromise<void> memoryReloadTask = nullptr;
+ 
+   // ---------------------------------------------------------------------------
+   // implements kj::TaskSet::ErrorHandler
+@@ -4636,6 +4738,7 @@ class Server::WorkerService final: public Service,
+   // No limits are enforced.
+ 
+   kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
++    requireLimitsNotExceeded();
+     return {};
+   }
+   void topUpActor() override {}
+@@ -4655,13 +4758,16 @@ class Server::WorkerService final: public Service,
+     return kj::maxValue;
+   }
+   kj::Maybe<EventOutcome> getLimitsExceeded() override {
++    if (memory->exceeded()) return EventOutcome::EXCEEDED_MEMORY;
+     return kj::none;
+   }
+   kj::Promise<void> onLimitsExceeded() override {
+-    return kj::NEVER_DONE;
++    return memory->onStopped();
+   }
+   void setCpuLimitNearlyExceededCallback(kj::Function<void(void)> cb) override {}
+-  void requireLimitsNotExceeded() override {}
++  void requireLimitsNotExceeded() override {
++    if (memory->exceeded()) kj::throwFatalException(memoryBudgetException());
++  }
+   void reportMetrics(RequestObserver& requestMetrics) override {}
+   kj::Duration consumeTimeElapsedForPeriodicLogging() override {
+     return 0 * kj::SECONDS;
+@@ -5726,7 +5832,17 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
+   }(),
+   };
+ 
+-  co_return co_await makeWorkerImpl(name, kj::mv(def), extensions, errorReporter);
++  auto service = co_await makeWorkerImpl(name, kj::mv(def), extensions, errorReporter);
++  // Config readers are owned by Server for its whole lifetime, including lazy reloads.
++  service->setMemoryReload(
++      [this, name = kj::str(name), conf, extensions]() -> kj::Promise<kj::Own<WorkerService>> {
++    auto base = co_await makeWorker(name, conf, extensions);
++    auto fresh = base.downcast<WorkerService>();
++    ConfigErrorReporter reporter(*this, name);
++    fresh->link(reporter);
++    co_return fresh;
++  });
++  co_return service;
+ }
+ 
+ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr name,
+@@ -5738,7 +5854,10 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
+ 
+   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
+   auto observer = kj::atomicRefcounted<IsolateObserver>();
+-  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
++  auto memory = kj::refcounted<ExperimentalMemoryBudget>(name);
++  KJ_REQUIRE(!memory->enabled() || def.localActorConfigs.size() == 0,
++      "Experimental memory budgets currently support stateless workers only");
++  auto limitEnforcer = kj::refcounted<ServerIsolateLimitEnforcer>(kj::addRef(*memory));
+ 
+   // Create the FsMap that will be used to map known file system
+   // roots to configurable locations.
+@@ -6160,8 +6279,10 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
+   kj::Maybe<kj::StringPtr> serviceName;
+   if (!def.isDynamic) serviceName = name;
+ 
++  KJ_REQUIRE(!memory->enabled() || errorReporter.actorClasses.size() == 0,
++      "Experimental memory budgets do not yet support Durable Object classes");
+   auto result = kj::refcounted<WorkerService>(channelTokenHandler, serviceName,
+-      globalContext->threadContext, monotonicClock, kj::mv(worker),
++      globalContext->threadContext, monotonicClock, kj::mv(worker), kj::mv(memory),
+       kj::mv(errorReporter.defaultEntrypoint), kj::mv(errorReporter.namedEntrypoints),
+       kj::mv(errorReporter.actorClasses), kj::mv(linkCallback),
+       KJ_BIND_METHOD(*this, abortAllActors), KJ_BIND_METHOD(*this, deleteAllActors),

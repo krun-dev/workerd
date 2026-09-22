@@ -17,7 +17,7 @@ jobs:
         run: |
           upstream_tag="v$(cut -d- -f1 VERSION)"
           git -C upstream/workerd fetch --depth=1 origin tag "$upstream_tag"
-      - run: python3 -m py_compile scripts/distro.py scripts/versioning.py tests/integration.py
+      - run: python3 -m py_compile scripts/distro.py scripts/versioning.py tests/integration.py tests/memory_integration.py
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - run: python3 scripts/distro.py prepare
       - run: git diff --exit-code && test -z "$(git -C upstream/workerd status --porcelain)"
