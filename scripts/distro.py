@@ -112,7 +112,7 @@ def prepare():
 
 def build():
     prepare()
-    image = os.environ.get('WORKERD_BUILD_IMAGE', 'workerd-cpu-builder:ubuntu24-clang19-bazel9.2.0')
+    image = os.environ.get('WORKERD_BUILD_IMAGE', 'workerd-cpu-builder:ubuntu24-clang19-bazel9.3.1')
     if 'WORKERD_BUILD_IMAGE' not in os.environ:
         run(['docker', 'build', '-f', 'docker/Dockerfile.build', '-t', image, 'docker'])
     image_id = output(['docker', 'image', 'inspect', '--format', '{{.Id}}', image])
