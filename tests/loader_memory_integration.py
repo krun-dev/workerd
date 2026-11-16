@@ -16,14 +16,29 @@ worker = r'''
 import { WorkerEntrypoint } from 'cloudflare:workers';
 let parent;
 let tailOnsets = 0;
+const tailOutcomes = [];
 const parentRetained = [];
 export class Observer extends WorkerEntrypoint {
-  tailStream() {
+  tailStream(onset) {
     tailOnsets++;
-    return () => {};
+    return ({ event }) => {
+      if (event.type === 'outcome') {
+        tailOutcomes.push({ entrypoint: onset.event.entrypoint ?? null, outcome: event.outcome });
+      }
+    };
   }
 }
 const source = `
+  import { WorkerEntrypoint } from 'cloudflare:workers';
+  export class Rpc extends WorkerEntrypoint {
+    async hardExceed() {
+      console.log('RPC about to exceed memory');
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const retained = new Uint8Array(96 * 1024 * 1024).fill(1);
+      await new Promise(resolve => setTimeout(resolve, 60000));
+      return retained.length;
+    }
+  }
   let id;
   const retained = [];
   export default {
@@ -31,6 +46,11 @@ const source = `
       id ??= crypto.randomUUID();
       if (new URL(request.url).pathname.endsWith('/hold')) {
         await new Promise(resolve => setTimeout(resolve, 60000));
+      }
+      if (new URL(request.url).pathname.endsWith('/hard-exceed')) {
+        console.log('about to exceed memory');
+        await new Promise(resolve => setTimeout(resolve, 100));
+        retained.push(new Uint8Array(96 * 1024 * 1024).fill(1));
       }
       if (new URL(request.url).pathname.endsWith('/allocate')) {
         retained.push(new Uint8Array(4 * 1024 * 1024).fill(1));
@@ -47,6 +67,7 @@ export default {
       return new Response(parent);
     }
     if (path === '/tails') return new Response(String(tailOnsets));
+    if (path === '/outcomes') return Response.json(tailOutcomes);
     if (path === '/parent-allocate') {
       parentRetained.push(new Uint8Array(4 * 1024 * 1024).fill(1));
       return new Response('ok');
@@ -60,6 +81,13 @@ export default {
       streamingTails: [ctx.exports.Observer({ props: {} })],
       globalOutbound: null,
     }));
+    if (path.endsWith('/rpc-exceed')) {
+      try {
+        return new Response(String(await loaded.getEntrypoint('Rpc').hardExceed()));
+      } catch {
+        return new Response('rpc canceled', { status: 503 });
+      }
+    }
     return loaded.getEntrypoint().fetch(request);
   }
 };
@@ -141,11 +169,39 @@ with tempfile.TemporaryDirectory(prefix='krun-loader-memory-') as tmp:
                 time.sleep(.05)
             checks = {
                 'tail_events_delivered': int(request(port, '/tails')[1]) > 0,
+                'successful_tail_outcome': any(event['outcome'] == 'ok' for event in json.loads(request(port, '/outcomes')[1])),
                 'child_reloaded': reloaded,
                 'other_child_unchanged': request(port, '/b') == (200, b_before),
                 'parent_unchanged': request(port, '/parent') == (200, parent),
                 'runtime_alive': proc.poll() is None,
             }
+            # Once a tail has started, a hard memory stop must emit a final error outcome;
+            # krun uses it to release the in-flight invocation and to report failures.
+            previous_outcomes = len(json.loads(request(port, '/outcomes')[1]))
+            status, _ = request(port, '/a/hard-exceed')
+            checks['hard_limit_returns_503'] = status == 503
+            deadline = time.monotonic() + 5
+            hard_outcomes = []
+            while time.monotonic() < deadline:
+                hard_outcomes = json.loads(request(port, '/outcomes')[1])[previous_outcomes:]
+                if any(event['outcome'] == 'exceededMemory' and event['entrypoint'] != 'Rpc' for event in hard_outcomes):
+                    break
+                time.sleep(.02)
+            checks['hard_limit_tail_outcome'] = any(event['outcome'] == 'exceededMemory' and event['entrypoint'] != 'Rpc' for event in hard_outcomes)
+
+            # RPC sessions have their own outcome and must report the same hard-limit reason.
+            previous_outcomes = len(json.loads(request(port, '/outcomes')[1]))
+            status, _ = request(port, '/a/rpc-exceed')
+            checks['rpc_hard_limit_returns_503'] = status == 503
+            deadline = time.monotonic() + 5
+            rpc_outcomes = []
+            while time.monotonic() < deadline:
+                rpc_outcomes = json.loads(request(port, '/outcomes')[1])[previous_outcomes:]
+                if any(event['outcome'] == 'exceededMemory' and event['entrypoint'] == 'Rpc' for event in rpc_outcomes):
+                    break
+                time.sleep(.02)
+            checks['rpc_hard_limit_tail_outcome'] = any(event['outcome'] == 'exceededMemory' and event['entrypoint'] == 'Rpc' for event in rpc_outcomes)
+
             # Keep a streaming-tail session alive while its receiver exceeds the limit. The
             # session must be canceled and the parent isolate must restart without killing workerd.
             def hold_child():

@@ -12,14 +12,15 @@ index 62534b9ce..0449d8117 100644
          "worker-factory-impl.h",
 diff --git a/src/workerd/server/factory/experimental-memory-limit.h b/src/workerd/server/factory/experimental-memory-limit.h
 new file mode 100644
-index 000000000..0d0c1f48c
+index 000000000..32c79e0b8
 --- /dev/null
 +++ b/src/workerd/server/factory/experimental-memory-limit.h
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,430 @@
 +#pragma once
 +
 +#include <workerd/api/worker-rpc.h>
 +#include <workerd/io/limit-enforcer.h>
++#include <workerd/io/observer.h>
 +#include <workerd/io/trace-stream.h>
 +#include <workerd/io/worker-interface.h>
 +#include <workerd/jsg/setup.h>
@@ -295,9 +296,11 @@ index 000000000..0d0c1f48c
 + public:
 +  MemoryLimitedWorkerInterface(kj::Own<WorkerInterface> inner,
 +      kj::Own<ExperimentalMemoryBudget> budget,
++      kj::Own<RequestObserver> observer,
 +      const kj::HttpHeaderTable& headerTable)
 +      : budget(kj::mv(budget)),
 +        inner(kj::mv(inner)),
++        observer(kj::mv(observer)),
 +        headerTable(headerTable) {
 +    this->budget->add(*this);
 +  }
@@ -321,6 +324,7 @@ index 000000000..0d0c1f48c
 +      co_await budget->canceler.wrap(inner->request(method, url, headers, body, tracker));
 +    }
 +    KJ_CATCH(e) {
++      if (budget->exceeded()) observer->reportFailure(memoryBudgetException());
 +      if (!budget->exceeded() || tracker.sent) kj::throwFatalException(kj::mv(e));
 +      constexpr kj::StringPtr message = "Worker stopped: memory limit exceeded.\n"_kj;
 +      kj::HttpHeaders out(headerTable);
@@ -385,7 +389,12 @@ index 000000000..0d0c1f48c
 +  template <typename T>
 +  kj::Promise<T> track(kj::Promise<T> promise) {
 +    budget->beginRequest();
-+    return budget->canceler.wrap(kj::mv(promise)).attach(kj::defer([state = kj::addRef(*budget)]() mutable {
++    return budget->canceler.wrap(kj::mv(promise))
++        .catch_([state = kj::addRef(*budget), requestObserver = kj::addRef(*observer)](
++                    kj::Exception&& e) mutable -> kj::Promise<T> {
++      if (state->exceeded()) requestObserver->reportFailure(memoryBudgetException());
++      return kj::mv(e);
++    }).attach(kj::defer([state = kj::addRef(*budget)]() mutable {
 +      state->endRequest();
 +    }));
 +  }
@@ -422,16 +431,18 @@ index 000000000..0d0c1f48c
 +  }
 +  kj::Own<ExperimentalMemoryBudget> budget;
 +  kj::Own<WorkerInterface> inner;
++  kj::Own<RequestObserver> observer;
 +  const kj::HttpHeaderTable& headerTable;
 +};
 +
 +inline kj::Own<WorkerInterface> wrapExperimentalMemoryInterface(kj::Own<WorkerInterface> inner,
 +    ExperimentalMemoryBudget& budget,
++    kj::Own<RequestObserver> observer,
 +    const kj::HttpHeaderTable& headerTable) {
 +  if (!budget.enabled()) return inner;
 +  return kj::heap<MemoryLimitedWorkerInterface>(
 +      newRevocableWebSocketWorkerInterface(kj::mv(inner), budget.onStopped()), kj::addRef(budget),
-+      headerTable);
++      kj::mv(observer), headerTable);
 +}
 +
 +}  // namespace workerd::server
@@ -460,7 +471,7 @@ index a6fa52bfd..607477e68 100644
    kj::TaskSet waitUntilTasks;
  
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index a0e60662b..99341b117 100644
+index 7d0e5925a..7a6a23ca3 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
 @@ -280,10 +280,19 @@ namespace {
@@ -584,7 +595,7 @@ index a0e60662b..99341b117 100644
  };
  
  // Records a request's outcome on its tracer, wrapping the WorkerInterface to observe failures.
-@@ -1156,16 +1180,19 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+@@ -1156,16 +1180,20 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
    }
  
    auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
@@ -595,6 +606,7 @@ index a0e60662b..99341b117 100644
    requestLimits = wrapExperimentalCpuLimiter(kj::mv(requestLimits), worker.name);
  #endif
 -  return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
++  auto memoryObserver = kj::addRef(*observer);
 +  auto entrypoint = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
        entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},
        kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
@@ -602,11 +614,11 @@ index a0e60662b..99341b117 100644
        kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
        kj::mv(metadata.clientAddress));
 +  return wrapExperimentalMemoryInterface(
-+      kj::mv(entrypoint), *worker.memory, threadContext.getHeaderTable());
++      kj::mv(entrypoint), *worker.memory, kj::mv(memoryObserver), threadContext.getHeaderTable());
  }
  
  }  // namespace
-@@ -1402,9 +1429,14 @@ kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex) {
+@@ -1402,9 +1430,14 @@ kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex) {
  CompiledWorker::Impl::Impl(const WorkerFactory& factory, kj::String name)
      : factory(factory),
        name(kj::mv(name)),
@@ -621,7 +633,7 @@ index a0e60662b..99341b117 100644
  void CompiledWorker::Impl::taskFailed(kj::Exception&& exception) {
    KJ_LOG(ERROR, exception);
  }
-@@ -1712,7 +1744,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+@@ -1712,7 +1745,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
    // The isolate of the Worker, or of the zygote that snapshots its startup.
    auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                           kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
@@ -630,7 +642,7 @@ index a0e60662b..99341b117 100644
      auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
        return Worker::Api::InboundListener{
          .protocol = kj::str(listener.protocol),
-@@ -1751,7 +1783,8 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+@@ -1751,7 +1784,8 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
    kj::Maybe<jsg::SnapshotConfig> snapshotConfig;
    // Not with a module fallback service either: the zygote has none, so a top level that tolerates
    // a failed import (`try { await import(x) } catch {}`) would bake the failure in.
@@ -640,7 +652,7 @@ index a0e60662b..99341b117 100644
        moduleFallback == kj::none &&
        supportsStartupSnapshot(impl->name, featureFlags, workerSource, envGlobals)) {
      // The zygote reports into a reporter of its own: its failures must never surface as the
-@@ -1888,6 +1921,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+@@ -1888,6 +1922,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
          : 0,
      .env_actor_classes = static_cast<uint32_t>(impl->actorClassChannels.size()),
    };
@@ -650,7 +662,7 @@ index a0e60662b..99341b117 100644
    impl->worker = kj::mv(worker);
    co_return kj::heap<CompiledWorker>(kj::mv(impl));
  }
-@@ -1957,6 +1993,40 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
+@@ -1957,6 +1994,44 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
    });
  }
  
@@ -684,6 +696,10 @@ index a0e60662b..99341b117 100644
 +        .exclusiveJoin(memory.onStopped().catch_([](kj::Exception&&) {}));
 +  }
 +  memory.revokeAll();
++  // Give already-produced trace outcomes a bounded opportunity to reach their tail consumers
++  // before unlink clears this generation's task set.
++  co_await impl->waitUntilTasks.onEmpty().exclusiveJoin(
++      impl->factory.getImpl().threadContext.getUnsafeTimer().afterDelay(100 * kj::MILLISECONDS));
 +  worker_unlink(worker);
 +  impl->worker = kj::none;
 +}
