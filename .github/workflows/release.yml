@@ -1,11 +1,18 @@
 name: CPU patch build probe
 on:
   workflow_dispatch:
+    inputs:
+      arch:
+        description: 'CPU architecture'
+        type: choice
+        required: true
+        default: amd64
+        options: [amd64, arm64]
 permissions:
   contents: read
 jobs:
   cpu-probe:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
