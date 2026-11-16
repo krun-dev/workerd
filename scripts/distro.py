@@ -69,7 +69,7 @@ def inputs():
     if not patches:
         raise RuntimeError('Empty patch series.')
     files = ['scripts/distro.py', 'scripts/versioning.py', 'docker/Dockerfile.build',
-             'tests/integration.py', 'tests/memory_integration.py']
+             'tests/integration.py', 'tests/memory_integration.py', 'tests/loader_memory_integration.py']
     files += [str(p.relative_to(ROOT)) for p in sorted((ROOT / 'tests/fixtures').iterdir()) if p.is_file()]
     return {'version': version, 'upstream_version': upstream_version,
             'upstream_commit': commit, 'bazel_version': bazel_version, 'patches': patches,
@@ -195,6 +195,7 @@ def test(binary=None):
     shutil.copytree(ROOT / 'tests/fixtures', directory)
     shutil.copy2(ROOT / 'tests/integration.py', directory / 'integration.py')
     shutil.copy2(ROOT / 'tests/memory_integration.py', directory / 'memory_integration.py')
+    shutil.copy2(ROOT / 'tests/loader_memory_integration.py', directory / 'loader_memory_integration.py')
     (BUILD / 'test.json').unlink(missing_ok=True)
     env = os.environ.copy()
     for key in list(env):
@@ -210,8 +211,13 @@ def test(binary=None):
     memory = json.loads((directory / 'memory-results.json').read_text())
     if len(memory['checks']) != 24 or not all(memory['checks'].values()):
         raise RuntimeError('Memory budget integration checks failed.')
+    run([sys.executable, directory / 'loader_memory_integration.py', binary], env=env)
+    loader_memory = json.loads((directory / 'loader-memory-results.json').read_text())
+    if len(loader_memory['checks']) != 4 or not all(loader_memory['checks'].values()):
+        raise RuntimeError('Dynamic WorkerLoader memory integration checks failed.')
     write_json(BUILD / 'test.json', {'binary_sha256': sha(binary), 'inputs': inputs(),
                                    'checks': results['checks'], 'memory_checks': memory['checks'],
+                                   'loader_memory_checks': loader_memory['checks'],
                                    'kernel': platform.release()})
 
 
