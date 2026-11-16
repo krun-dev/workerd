@@ -112,7 +112,7 @@ def prepare():
 
 def build():
     prepare()
-    image = os.environ.get('WORKERD_BUILD_IMAGE', 'workerd-cpu-builder:ubuntu24-clang19-bazel9.3.1')
+    image = os.environ.get('WORKERD_BUILD_IMAGE', 'workerd-builder:ubuntu24-bazel9.3.1')
     if 'WORKERD_BUILD_IMAGE' not in os.environ:
         run(['docker', 'build', '-f', 'docker/Dockerfile.build', '-t', image, 'docker'])
     image_id = output(['docker', 'image', 'inspect', '--format', '{{.Id}}', image])
@@ -122,7 +122,7 @@ def build():
     memory = int(os.environ.get('WORKERD_BUILD_MEMORY_MB', '8000'))
     if jobs < 1 or memory < 1024:
         raise RuntimeError('Use positive jobs and at least 1024 MiB build memory.')
-    flags = ['--repo_env=CC=clang-19', '--repository_cache=/cache/repository',
+    flags = ['--repository_cache=/cache/repository',
              '--config=release_linux', '--strip=always',
              f'--jobs={jobs}', f'--local_resources=memory={memory}', TARGET]
     network = os.environ.get('WORKERD_BUILD_NETWORK', 'bridge')
