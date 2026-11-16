@@ -182,6 +182,7 @@ except subprocess.TimeoutExpired:
 cases = {case['name']: case for case in results['cases']}
 checks = {
     'baseline_loop_blocks_b': 'error' in cases['baseline_infinite_loop']['b'],
+    'limit_log_identifies_worker': 'workerName = a;' in (ROOT / 'limited.log').read_text(),
     'io_wait_not_cpu': cases['io_wait_excluded']['result'].get('status') == 200,
     'other_cpu_not_charged': cases['other_worker_cpu_excluded']['a'].get('status') == 200 and
                              cases['other_worker_cpu_excluded']['process_cpu_ms'] > 50,

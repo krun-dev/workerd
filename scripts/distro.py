@@ -205,7 +205,7 @@ def test(binary=None):
     env['NO_PROXY'] = env['no_proxy'] = '127.0.0.1,localhost'
     run([sys.executable, directory / 'integration.py', binary], env=env)
     results = json.loads((directory / 'results.json').read_text())
-    if len(results['checks']) != 14 or not all(results['checks'].values()):
+    if len(results['checks']) != 15 or not all(results['checks'].values()):
         raise RuntimeError('CPU budget integration checks failed.')
     run([sys.executable, directory / 'memory_integration.py', binary], env=env)
     memory = json.loads((directory / 'memory-results.json').read_text())

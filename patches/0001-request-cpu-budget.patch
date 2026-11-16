@@ -331,7 +331,7 @@ index adac4c8e8..a0e60662b 100644
    auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
 +  kj::Own<LimitEnforcer> requestLimits = kj::refcounted<NullLimitEnforcer>();
 +#if __linux__
-+  requestLimits = wrapExperimentalCpuLimiter(kj::mv(requestLimits), "<worker>");
++  requestLimits = wrapExperimentalCpuLimiter(kj::mv(requestLimits), worker.name);
 +#endif
    return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
 -      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
