@@ -15,7 +15,7 @@
 | 内存超限延迟销毁 | 旧实例停止接单，允许在途请求和后台任务在宽限期内完成，完成后提前清理；到期或内存继续增长超过紧急阈值时强制终止。没有后续请求也会清理旧实例。 |
 | 按需重新加载 | 内存超限实例清理后，后续请求通过原配置创建新实例，重新初始化全局状态；退出期间的新请求等待，并发请求共享一次重建。不会自动重放失败请求。 |
 | 连接与资源清理 | 强制取消在途任务、后台任务和可撤销连接，释放入口引用与 isolate；支持普通 HTTP、流式响应、WebSocket 和 service binding `fetch()` 的相关路径。 |
-| Linux AMD64 / ARM64 构建与发版 | GitHub Actions 分别构建、测试后发布 `workerd-linux-64.gz` 和 `workerd-linux-arm64.gz`；版本沿用上游版本并追加 `-krun.N`，同一上游版本递增，更换上游版本后从 `-krun.0` 开始。 |
+| Linux AMD64 构建与发版 | GitHub Actions 构建、测试后发布 `workerd-linux-64.gz`；版本沿用上游版本并追加 `-krun.N`，同一上游版本递增，更换上游版本后从 `-krun.0` 开始。 |
 
 以上描述当前 `main` 的能力。内存预算尚未包含在 `v1.20260920.1-krun.0` 的已发布二进制中；各版本包含的改动见 [CHANGES.md](CHANGES.md)。
 
@@ -45,17 +45,17 @@ CPU 超限中断当前执行，不自动重建整个 isolate。内存超限则�
 
 ## 支持范围与限制
 
-- 构建和发版目标为 **Linux AMD64 / ARM64**，采用 Ubuntu 24.04 构建容器与上游固定的工具链和 sysroot。静态链接仅完成独立实验，尚未接入正式发行流程，见 [静态链接验证](docs/static-linking.md)。
+- 构建和发版目标为 **Linux AMD64**，采用 Ubuntu 24.04 构建容器与上游固定的工具链和 sysroot。静态链接仅完成独立实验，尚未接入正式发行流程，见 [静态链接验证](docs/static-linking.md)。
 - 内存预算已验证静态和动态加载的 JavaScript Worker、Workers RPC 和 streaming tail；超限时会取消未结束的会话。**开启内存预算时拒绝 Durable Object / Workflow 配置和其他未纳入生命周期管理的 CustomEvent**；Python、Inspector 等路径尚未验证。
 - 内存计量不覆盖所有原生分配，也不是 RSS 硬上限。预算以上保留 16 MiB 紧急余量，检测和中断仍可能超调；销毁 isolate 后，分配器也可能保留空闲内存供复用。
 - CPU 时间只覆盖 Worker 执行线程中的请求执行，不包含启动和其他操作系统线程；尾部事件或采集数据丢失时会少记，适用于监控而非结算。
 - 同步 JavaScript 阻塞事件循环时，仍可能影响其他业务直至中断；这些预算不提供完整的进程级资源隔离，也不保证业务 `finally` 或 JS disposer 执行。
 
-内存退出、重建、watchdog 和连接清理的详细说明见 [内存预算文档](docs/memory-limit.md)。AMD64 真实二进制已通过 25 项内存检查、15 项 CPU 检查和 14 项动态加载检查，另有 10 项发行脚本单元测试；两个架构的完整发版验证由 CI 执行。
+内存退出、重建、watchdog 和连接清理的详细说明见 [内存预算文档](docs/memory-limit.md)。AMD64 真实二进制已通过 25 项内存检查、15 项 CPU 检查和 14 项动态加载检查，另有 10 项发行脚本单元测试；AMD64 完整发版验证由 CI 执行。
 
 ## 构建与验证
 
-需要 Git、Python 3 和 Docker，在 Linux AMD64 或 ARM64 环境运行：
+需要 Git、Python 3 和 Docker，在 Linux AMD64 环境运行：
 
 ```sh
 git submodule update --init --recursive
@@ -71,7 +71,7 @@ python3 scripts/distro.py test
 upstream/workerd/        官方源码 submodule
 patches/                自维护补丁及应用顺序
 scripts/                版本管理、构建、测试和打包脚本
-docker/                 Linux AMD64 / ARM64 构建环境
+docker/                 Linux AMD64 构建环境
 tests/                  测试脚本与 Worker 示例
 docs/                   实验和验证记录
 .github/workflows/      GitHub 检查及 Release 构建流程

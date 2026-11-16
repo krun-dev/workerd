@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Publish VERSION after both Linux builds and tests pass'
+        description: 'Publish VERSION after the Linux AMD64 build and tests pass'
         type: boolean
         default: false
   push:
@@ -25,8 +25,6 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     steps:
@@ -94,14 +92,13 @@ jobs:
           cd dist
           sha256sum -c *.sha256
           test -s workerd-linux-64.gz
-          test -s workerd-linux-arm64.gz
           if tag_sha="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha 2>/dev/null)"; then
             test "$tag_sha" = "$GITHUB_SHA"
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             # A user may have published the Release before the binary was built.
             # Keep its title, notes and prerelease status; retries replace our assets.
-            gh release upload "$RELEASE_TAG" workerd-linux-64.gz workerd-linux-arm64.gz --clobber
+            gh release upload "$RELEASE_TAG" workerd-linux-64.gz --clobber
           else
-            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --generate-notes --title "$RELEASE_TAG" workerd-linux-64.gz workerd-linux-arm64.gz
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --generate-notes --title "$RELEASE_TAG" workerd-linux-64.gz
           fi
