@@ -712,23 +712,20 @@ index 5b64b1fa8..7ddaa75c4 100644
          /// request; `tails` receive the request's trace once it completes (the server passes none
          /// for a request that is itself a tail worker's, so that tails do not trace themselves,
 diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
-index b98a5b0c6..b67e1f8cc 100644
+index b98a5b0c6..2df705dcd 100644
 --- a/src/workerd/server/server/worker.rs
 +++ b/src/workerd/server/server/worker.rs
-@@ -17,10 +17,13 @@ use std::ptr;
+@@ -17,7 +17,10 @@ use std::ptr;
  use std::rc::Rc;
  use std::rc::Weak;
  
++use ::worker::Interface;
 +use futures::FutureExt;
  use futures::future::LocalBoxFuture;
 +use futures::future::Shared;
  use hashlink::LinkedHashMap;
  use kj_rs::KjMaybe;
  use kj_rs::KjOwn;
-+use worker::Interface;
- use workerd_capnp::service_designator;
- use workerd_capnp::worker;
- 
 @@ -65,6 +68,7 @@ use crate::config::invalid_config_error;
  use crate::config::text;
  use crate::loader::WorkerLoaderNamespace;
@@ -935,7 +932,7 @@ index b98a5b0c6..b67e1f8cc 100644
 +            let ready = self.worker.reload_after_memory_retirement()?;
 +            let service = Rc::clone(&self.worker);
 +            let entrypoint = self.entrypoint.clone();
-+            return Ok(worker::PromisedInterface::new(async move {
++            return Ok(::worker::PromisedInterface::new(async move {
 +                ready.await?;
 +                service.start_request(entrypoint.as_deref(), props, None, metadata, false)
 +            })
