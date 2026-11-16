@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    python3 tcl git curl ca-certificates xz-utils unzip patch pkg-config \
+    python3 tcl git curl ca-certificates xz-utils unzip patch pkg-config libxml2 \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 RUN case "$TARGETARCH" in \
