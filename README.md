@@ -44,7 +44,7 @@ CPU 超限中断当前执行，不自动重建整个 isolate。内存超限则�
 ## 支持范围与限制
 
 - 当前构建和发版目标为 **Linux AMD64**，采用 Ubuntu 24.04 / glibc 2.39 构建环境。静态链接仅完成独立实验，尚未接入正式发行流程，见 [静态链接验证](docs/static-linking.md)。
-- 内存预算的部署范围为静态配置的普通 JavaScript HTTP Worker。**开启内存预算时拒绝 Durable Object 配置/导出类和 CustomEvent（包括 Workers RPC）**；Python、Inspector、动态 Worker Loader 等路径未纳入本轮验证。
+- 内存预算已验证静态和动态加载的 JavaScript Worker、Workers RPC 和 streaming tail；超限时会取消未结束的会话。**开启内存预算时拒绝 Durable Object / Workflow 配置和其他未纳入生命周期管理的 CustomEvent**；Python、Inspector 等路径尚未验证。
 - 内存计量不覆盖所有原生分配，也不是 RSS 硬上限。预算以上保留 16 MiB 紧急余量，检测和中断仍可能超调；销毁 isolate 后，分配器也可能保留空闲内存供复用。
 - 同步 JavaScript 阻塞事件循环时，仍可能影响其他业务直至中断；这些预算不提供完整的进程级资源隔离，也不保证业务 `finally` 或 JS disposer 执行。
 

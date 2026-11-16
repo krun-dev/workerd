@@ -209,11 +209,11 @@ def test(binary=None):
         raise RuntimeError('CPU budget integration checks failed.')
     run([sys.executable, directory / 'memory_integration.py', binary], env=env)
     memory = json.loads((directory / 'memory-results.json').read_text())
-    if len(memory['checks']) != 24 or not all(memory['checks'].values()):
+    if len(memory['checks']) != 25 or not all(memory['checks'].values()):
         raise RuntimeError('Memory budget integration checks failed.')
     run([sys.executable, directory / 'loader_memory_integration.py', binary], env=env)
     loader_memory = json.loads((directory / 'loader-memory-results.json').read_text())
-    if len(loader_memory['checks']) != 4 or not all(loader_memory['checks'].values()):
+    if len(loader_memory['checks']) != 9 or not all(loader_memory['checks'].values()):
         raise RuntimeError('Dynamic WorkerLoader memory integration checks failed.')
     write_json(BUILD / 'test.json', {'binary_sha256': sha(binary), 'inputs': inputs(),
                                    'checks': results['checks'], 'memory_checks': memory['checks'],

@@ -12,13 +12,15 @@ index 62534b9ce..0449d8117 100644
          "worker-factory-impl.h",
 diff --git a/src/workerd/server/factory/experimental-memory-limit.h b/src/workerd/server/factory/experimental-memory-limit.h
 new file mode 100644
-index 000000000..d8e4f05c1
+index 000000000..0d0c1f48c
 --- /dev/null
 +++ b/src/workerd/server/factory/experimental-memory-limit.h
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,419 @@
 +#pragma once
 +
++#include <workerd/api/worker-rpc.h>
 +#include <workerd/io/limit-enforcer.h>
++#include <workerd/io/trace-stream.h>
 +#include <workerd/io/worker-interface.h>
 +#include <workerd/jsg/setup.h>
 +#include <workerd/util/exception.h>
@@ -359,14 +361,24 @@ index 000000000..d8e4f05c1
 +    return track(inner->test());
 +  }
 +  kj::Promise<CustomEvent::Result> customEvent(kj::Own<CustomEvent> event) override {
-+    if (budget->exceeded()) {
++    if (budget->isRetiring()) {
 +      auto e = memoryBudgetException();
 +      event->failed(e);
 +      return kj::mv(e);
 +    }
-+    // RPC can export capabilities that outlive this entrypoint and retain its IoContext.
-+    // Until this budget integrates their lifetime, do not admit custom events in memory-limited mode.
-+    return event->notSupported().attach(kj::mv(event));
++    // Both sessions stay pending while their capabilities are alive and revoke those capabilities
++    // when canceled. Track and cancel them with this generation on memory retirement.
++    if (event->getType() == tracing::TailStreamCustomEvent::TYPE ||
++        event->getType() == api::JsRpcSessionCustomEvent::WORKER_RPC_EVENT_TYPE) {
++      return kj::evalNow([this, event = kj::mv(event)]() mutable {
++        return track(inner->customEvent(kj::mv(event)));
++      });
++    }
++    // Other custom events may export capabilities whose lifetimes are not yet integrated.
++    // Capture a synchronous rejection before returning across the Rust FFI boundary.
++    return kj::evalNow([event = kj::mv(event)]() mutable {
++      return event->notSupported().attach(kj::mv(event));
++    });
 +  }
 +
 + private:

@@ -2,6 +2,7 @@ import {WorkerEntrypoint} from 'cloudflare:workers';
 
 export class Rpc extends WorkerEntrypoint {
   hello() { return 'rpc-ok'; }
+  async hold() { await new Promise(resolve => setTimeout(resolve, 60000)); return 'rpc-finished'; }
 }
 
 const retained = [];

@@ -5,9 +5,9 @@ export default {
     if (path === '/tick') return new Response(String(++ticks));
     if (path === '/ticks') return new Response(String(ticks));
     if (path.startsWith('/binding/')) return env.A.fetch('http://a/' + path.slice(9));
-    if (path === '/rpc') {
+    if (path === '/rpc' || path === '/rpc-pending') {
       try {
-        return new Response(await env.RPC.hello());
+        return new Response(await (path === '/rpc' ? env.RPC.hello() : env.RPC.hold()));
       } catch {
         return new Response('rpc-rejected');
       }
