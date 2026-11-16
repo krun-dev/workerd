@@ -25,7 +25,7 @@ WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS=5000 \
 
 ## 实现与范围
 
-内存状态、入口引用和截止时间管理位于 `experimental-memory-limit.h`。`server.c++` 接入上游限额接口、WorkerService 清理和原有创建/链接流程；`BUILD.bazel` 声明新头文件。不修改 CPU 补丁、V8、JSG 或 I/O 核心实现。
+内存状态、入口引用和截止时间管理位于 `experimental-memory-limit.h`。`factory/worker-factory.c++` 和 `server/worker.rs` 分别接入上游限额接口、WorkerService 清理和创建/链接流程；`factory/BUILD.bazel` 声明新头文件。不修改 CPU 补丁、V8、JSG 或 I/O 核心实现。
 
 正常实例不创建内存监控线程。只有进入退出阶段的实例才创建一个等待截止时间的线程；它不轮询，通过线程安全的 `TerminateExecution()` 中断阻塞事件循环的 JS。清理前取消并 join 该线程，避免其访问已销毁的 V8 isolate。KJ 定时器负责异步请求的截止时间，KJ 通知与资源撤销都在事件循环线程执行。
 
@@ -33,7 +33,7 @@ WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS=5000 \
 
 这是有超调的实验性预算，**不是 RSS 硬上限**。未登记到 V8 的原生分配不计入；一次很大的原生分配仍可能先触发进程 OOM。释放 isolate 也不意味着 RSS 立即等量下降，分配器可能保留空闲内存供后续复用。Linux cgroup `memory.max` 可作进程级兜底，但不能单独杀死同进程中的某个 isolate。
 
-部署范围为静态配置的普通 JavaScript HTTP Worker 和 service binding `fetch()`。开启内存预算时拒绝 Durable Object 配置/导出类和 CustomEvent（包括 Workers RPC）；这些生命周期未纳入本补丁验证。Python、Inspector、动态 Worker Loader 等路径也不属于本次验证范围。关闭预算时保持上游行为。
+已验证静态与动态加载的 JavaScript Worker、service binding `fetch()`、Workers RPC 和 streaming tail。强制清理时取消尚未结束的会话，并在有界时间内尝试发送 tail outcome；超过时间仍可能丢失。内存检查存在超调，RPC 结果可能在超限被检测到之前返回。开启预算时拒绝 Durable Object / Workflow 配置及其他尚未纳入生命周期管理的 CustomEvent；Python 和 Inspector 等路径尚未验证。关闭预算时保持上游行为。
 
 ## 验证
 
@@ -42,11 +42,11 @@ python3 scripts/distro.py build
 python3 scripts/distro.py test
 ```
 
-在 Linux AMD64 上对真实 workerd 二进制验证：JS 堆、ArrayBuffer、跨请求累计分配、无后续请求的销毁、在途请求正常完成、后台任务的完成与取消、截止时间、同步死循环、重复重建、并发重建合并、流式响应、WebSocket、外部 fetch、RPC 拒绝、CPU 预算同时启用和启动超限。构建发布流程要求这些测试及既有 CPU 测试通过。
+在 Linux AMD64 上对真实二进制验证：堆、ArrayBuffer、累计分配、在途任务排空和取消、重复重建、流和 WebSocket、外部 fetch、RPC 和 streaming tail 在超限时的清理、动态 Worker 隔离及同时开启 CPU 限制。构建发布流程要求这些测试及 CPU 测试通过。
 
-本轮干净源码构建后，24 项内存集成检查、14 项 CPU 回归检查全部通过；另有 8 项发行脚本单元测试通过。构建与测试核对同一二进制 SHA-256。
+AMD64 真实二进制已通过 25 项内存、15 项 CPU 和 14 项动态加载检查；另有 10 项发行脚本单元测试。构建与测试核对同一二进制 SHA-256，CI 分别验证两个目标架构。
 
-测试机为 `pc.work.zou.cool`，内核 `6.19.11-arch1-1`，构建环境为 Ubuntu 24.04 / Clang 19。内核 6.6 尚未在本轮实测；内存特性不依赖新的 Linux 内核接口。
+在隔离的 AMD64 Kubernetes Pod 中完成源码构建和实测；使用上游版本指定的 Bazel、LLVM 和 Rust 工具链。
 
 ## 官方行为与参考
 

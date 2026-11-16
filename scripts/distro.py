@@ -54,6 +54,10 @@ def inputs():
     version = (ROOT / 'VERSION').read_text().strip()
     upstream_version = versioning.upstream_version(UPSTREAM)
     versioning.validate(version, upstream_version)
+    bazel_version = (UPSTREAM / '.bazelversion').read_text().strip()
+    dockerfile = (ROOT / 'docker/Dockerfile.build').read_text()
+    if f'/bazel-{bazel_version}-linux-' not in dockerfile:
+        raise RuntimeError(f'Build image must use upstream Bazel {bazel_version}.')
     patches = []
     for name in (ROOT / 'patches/series').read_text().splitlines():
         name = name.strip()
@@ -65,10 +69,10 @@ def inputs():
     if not patches:
         raise RuntimeError('Empty patch series.')
     files = ['scripts/distro.py', 'scripts/versioning.py', 'docker/Dockerfile.build',
-             'tests/integration.py', 'tests/memory_integration.py']
+             'tests/integration.py', 'tests/memory_integration.py', 'tests/loader_memory_integration.py']
     files += [str(p.relative_to(ROOT)) for p in sorted((ROOT / 'tests/fixtures').iterdir()) if p.is_file()]
     return {'version': version, 'upstream_version': upstream_version,
-            'upstream_commit': commit, 'patches': patches,
+            'upstream_commit': commit, 'bazel_version': bazel_version, 'patches': patches,
             'recipe': {p: sha(ROOT / p) for p in files}}
 
 
@@ -110,11 +114,22 @@ def prepare():
     print('Prepared clean upstream + patches:', SOURCE)
 
 
+def native_arch():
+    arch = platform.machine().lower()
+    if arch in ('x86_64', 'amd64'):
+        return 'amd64', 'x86_64', '64'
+    if arch in ('aarch64', 'arm64'):
+        return 'arm64', 'aarch64', 'arm64'
+    raise RuntimeError(f'Unsupported build architecture: {arch}')
+
+
 def build():
+    docker_arch, machine, _ = native_arch()
     prepare()
-    image = os.environ.get('WORKERD_BUILD_IMAGE', 'workerd-cpu-builder:ubuntu24-clang19-bazel9.2.0')
+    bazel_version = (UPSTREAM / '.bazelversion').read_text().strip()
+    image = os.environ.get('WORKERD_BUILD_IMAGE', f'workerd-builder:ubuntu24-bazel{bazel_version}-{docker_arch}')
     if 'WORKERD_BUILD_IMAGE' not in os.environ:
-        run(['docker', 'build', '-f', 'docker/Dockerfile.build', '-t', image, 'docker'])
+        run(['docker', 'build', '--platform', f'linux/{docker_arch}', '-f', 'docker/Dockerfile.build', '-t', image, 'docker'])
     image_id = output(['docker', 'image', 'inspect', '--format', '{{.Id}}', image])
     cache = Path(os.environ.get('WORKERD_BUILD_CACHE', str(BUILD / 'cache'))).resolve()
     cache.mkdir(parents=True, exist_ok=True)
@@ -122,7 +137,7 @@ def build():
     memory = int(os.environ.get('WORKERD_BUILD_MEMORY_MB', '8000'))
     if jobs < 1 or memory < 1024:
         raise RuntimeError('Use positive jobs and at least 1024 MiB build memory.')
-    flags = ['--repo_env=CC=clang-19', '--repository_cache=/cache/repository',
+    flags = ['--repository_cache=/cache/repository',
              '--config=release_linux', '--strip=always',
              f'--jobs={jobs}', f'--local_resources=memory={memory}', TARGET]
     network = os.environ.get('WORKERD_BUILD_NETWORK', 'bridge')
@@ -131,7 +146,7 @@ def build():
                 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy']:
         if key in os.environ:
             proxy_args += ['-e', key]  # Pass by name so credentials never appear in command logs.
-    run(['docker', 'run', '--rm', '--platform=linux/amd64',
+    run(['docker', 'run', '--rm', f'--platform=linux/{docker_arch}',
          '--network', network, *proxy_args,
          '--user', f'{os.getuid()}:{os.getgid()}', '-e', 'HOME=/tmp',
          '-v', f'{ROOT}:/repo', '-v', f'{cache}:/cache',
@@ -140,7 +155,7 @@ def build():
     # bazel-bin is a symlink into a container path. Copy the binary while that path is mounted.
     staged_binary = BUILD / 'workerd-release.new'
     staged_binary.unlink(missing_ok=True)
-    run(['docker', 'run', '--rm', '--platform=linux/amd64',
+    run(['docker', 'run', '--rm', f'--platform=linux/{docker_arch}',
          '--user', f'{os.getuid()}:{os.getgid()}',
          '-v', f'{ROOT}:/repo', '-v', f'{cache}:/cache', image,
          'cp', '/repo/.build/workerd/bazel-bin/src/workerd/server/workerd', '/repo/.build/workerd-release.new'])
@@ -149,17 +164,18 @@ def build():
     staged_binary.replace(binary)
     data = json.loads((BUILD / 'inputs.json').read_text())
     data.update({'binary_sha256': sha(binary), 'build_image': image, 'build_image_id': image_id,
-                 'bazel_flags': flags, 'platform': 'linux-x86_64',
+                 'bazel_flags': flags, 'platform': f'linux-{machine}',
                  'build_network': network,
-                 'libc_baseline': 'Ubuntu 24.04 / glibc 2.39',
+                 'libc_baseline': 'upstream-pinned Linux sysroot',
                  'distro_commit': output(['git', 'rev-parse', 'HEAD']),
                  'distro_dirty': bool(output(['git', 'status', '--porcelain']))})
     write_json(BUILD / 'build.json', data)
 
 
 def test(binary=None):
-    if platform.system() != 'Linux' or platform.machine() != 'x86_64':
-        raise RuntimeError('Integration tests require a native Linux x86_64 host.')
+    if platform.system() != 'Linux':
+        raise RuntimeError('Integration tests require a native Linux host.')
+    native_arch()
     binary = Path(binary or BUILD / 'workerd-release').resolve()
     # Fixed test ports are owned only by this test run. Fail before starting if unavailable.
     import socket
@@ -179,6 +195,7 @@ def test(binary=None):
     shutil.copytree(ROOT / 'tests/fixtures', directory)
     shutil.copy2(ROOT / 'tests/integration.py', directory / 'integration.py')
     shutil.copy2(ROOT / 'tests/memory_integration.py', directory / 'memory_integration.py')
+    shutil.copy2(ROOT / 'tests/loader_memory_integration.py', directory / 'loader_memory_integration.py')
     (BUILD / 'test.json').unlink(missing_ok=True)
     env = os.environ.copy()
     for key in list(env):
@@ -188,14 +205,19 @@ def test(binary=None):
     env['NO_PROXY'] = env['no_proxy'] = '127.0.0.1,localhost'
     run([sys.executable, directory / 'integration.py', binary], env=env)
     results = json.loads((directory / 'results.json').read_text())
-    if len(results['checks']) != 14 or not all(results['checks'].values()):
+    if len(results['checks']) != 15 or not all(results['checks'].values()):
         raise RuntimeError('CPU budget integration checks failed.')
     run([sys.executable, directory / 'memory_integration.py', binary], env=env)
     memory = json.loads((directory / 'memory-results.json').read_text())
-    if len(memory['checks']) != 24 or not all(memory['checks'].values()):
+    if len(memory['checks']) != 25 or not all(memory['checks'].values()):
         raise RuntimeError('Memory budget integration checks failed.')
+    run([sys.executable, directory / 'loader_memory_integration.py', binary], env=env)
+    loader_memory = json.loads((directory / 'loader-memory-results.json').read_text())
+    if len(loader_memory['checks']) != 14 or not all(loader_memory['checks'].values()):
+        raise RuntimeError('Dynamic WorkerLoader memory integration checks failed.')
     write_json(BUILD / 'test.json', {'binary_sha256': sha(binary), 'inputs': inputs(),
                                    'checks': results['checks'], 'memory_checks': memory['checks'],
+                                   'loader_memory_checks': loader_memory['checks'],
                                    'kernel': platform.release()})
 
 
@@ -212,7 +234,10 @@ def package():
         raise RuntimeError('Release packaging requires a clean, committed distribution repository.')
     if build_data['distro_commit'] != output(['git', 'rev-parse', 'HEAD']):
         raise RuntimeError('Distribution commit changed since build.')
-    name = f"workerd-{current['version']}-linux-x86_64"
+    _, machine, asset_arch = native_arch()
+    if build_data.get('platform') != f'linux-{machine}':
+        raise RuntimeError('Build architecture does not match the native test and package host.')
+    name = f"workerd-{current['version']}-linux-{machine}"
     dist = ROOT / 'dist'
     dist.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='package-', dir=BUILD) as tmp:
@@ -231,7 +256,7 @@ def package():
     shutil.copy2(BUILD / 'build.json', dist / f'{name}.build-info.json')
     shutil.copy2(BUILD / 'test.json', dist / f'{name}.test-info.json')
     # Match upstream's directly downloadable gzip-compressed Linux executable.
-    compressed = dist / 'workerd-linux-64.gz'
+    compressed = dist / f'workerd-linux-{asset_arch}.gz'
     with binary.open('rb') as source, compressed.open('wb') as target:
         with gzip.GzipFile(filename='workerd', mode='wb', fileobj=target, mtime=0) as archive:
             shutil.copyfileobj(source, archive)

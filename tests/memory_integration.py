@@ -255,10 +255,61 @@ def disabled():
         assert not s.disposed()
 
 
-def rpc_rejected():
+def rpc_canceled_on_retirement():
     with server() as s:
-        assert request(s.b, '/rpc')['body'] == 'rpc-rejected'
-        assert request(s.a)['body'] == 'a-ok'
+        assert request(s.b, '/rpc')['body'] == 'rpc-ok'
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(request, s.b, '/rpc-pending')
+            time.sleep(.1)
+            assert request(s.a, '/heap')['status'] == 503
+            assert pending.result(timeout=3)['body'] == 'rpc-rejected'
+        s.stopped()
+        assert request(s.b, '/rpc')['body'] == 'rpc-ok'
+
+
+def unsupported_custom_event_does_not_abort():
+    with tempfile.TemporaryDirectory(prefix='workerd-unsupported-tail-') as directory:
+        root = pathlib.Path(directory)
+        (root / 'source.js').write_text('export default { fetch() { return new Response("ok"); } };')
+        (root / 'tail.js').write_text('export default { tail() {} };')
+        (root / 'config.capnp').write_text('''using W = import "/workerd/workerd.capnp";
+const config :W.Config = (
+  services = [
+    (name = "source", worker = (compatibilityDate = "2026-09-28",
+      modules = [(name = "source.js", esModule = embed "source.js")], tails = ["tail"])),
+    (name = "tail", worker = (compatibilityDate = "2026-09-28",
+      modules = [(name = "tail.js", esModule = embed "tail.js")]))
+  ],
+  sockets = [(name = "entry", address = "127.0.0.1:0", http = (), service = "source")]
+);''')
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        env = os.environ.copy()
+        env['WORKERD_EXPERIMENTAL_MEMORY_MB'] = '64'
+        with (root / 'workerd.log').open('w+') as log:
+            proc = subprocess.Popen([BINARY, 'serve', 'config.capnp',
+                                     f'--socket-fd=entry={listener.fileno()}'],
+                                    cwd=root, env=env, stdout=log, stderr=log,
+                                    pass_fds=(listener.fileno(),))
+            listener.close()
+            try:
+                wait_for(lambda: proc.poll() is not None or request(port)['status'] == 200)
+                for _ in range(5):
+                    assert request(port)['body'] == 'ok'
+                    time.sleep(.05)
+                    assert proc.poll() is None, 'unsupported tail event aborted workerd'
+                log.flush()
+                log.seek(0)
+                assert 'trace event not supported' in log.read(), 'tail event was not delivered'
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
 
 
 def websocket():
@@ -488,7 +539,8 @@ cases = {
     'stream_aborted': streaming,
     'websocket_closed': websocket,
     'external_fetch_cancelled': external_fetch_cancelled,
-    'rpc_rejected': rpc_rejected,
+    'rpc_canceled_on_retirement': rpc_canceled_on_retirement,
+    'unsupported_custom_event_does_not_abort': unsupported_custom_event_does_not_abort,
     'memory_with_cpu_budget': lambda: allocation('/buffers', cpu=1000),
     'startup_memory': startup,
     'durable_objects_rejected': durable_rejected,

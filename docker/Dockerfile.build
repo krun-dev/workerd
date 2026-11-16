@@ -1,11 +1,14 @@
 FROM ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    clang-19 libc++-19-dev libc++abi-19-dev lld-19 clang-format-19 \
-    python3 tcl git curl ca-certificates xz-utils unzip patch pkg-config \
+    python3 tcl git curl ca-certificates xz-utils unzip patch pkg-config libxml2 \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -fL https://releases.bazel.build/9.2.0/release/bazel-9.2.0-linux-x86_64 \
-    -o /usr/local/bin/bazel \
-    && echo '7668a95db1250f12c40407251e4e203b4ec8bf39bc495d2f485b2d8c99048694  /usr/local/bin/bazel' | sha256sum -c - \
-    && chmod +x /usr/local/bin/bazel \
-    && ln -s /usr/bin/clang-19 /usr/local/bin/clang
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) bazel_arch=x86_64; checksum=7f775b54bbec487efaf0f49ccda1d2ed02cd34f582edfdd6aeeec76e39ef585c ;; \
+      arm64) bazel_arch=arm64; checksum=10ba9cb76d4ee748d274dcc2981992bb12b74a203dc41a9c2eceeb8f29359366 ;; \
+      *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fL "https://releases.bazel.build/9.3.1/release/bazel-9.3.1-linux-$bazel_arch" -o /usr/local/bin/bazel \
+    && echo "$checksum  /usr/local/bin/bazel" | sha256sum -c - \
+    && chmod +x /usr/local/bin/bazel
 WORKDIR /work

@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-- Add an opt-in per-isolate memory budget for ordinary JavaScript HTTP Workers. Stop admitting requests to an exceeded isolate, allow in-flight work a configurable grace period, then release it. Subsequent requests share one lazy reload; forced failures return HTTP 503.
-- Keep memory-limited Durable Objects and CustomEvent/RPC disabled until their longer-lived references can be revoked safely. The budget covers V8-reported heap and external memory, not a hard process RSS limit.
-- Add real-binary cleanup tests to the Linux AMD64 release gate. V8 source remains unchanged.
+- Update the pinned official workerd release to v1.20261116.1 and port the CPU and memory budget patches to its Rust/C++ server architecture and pinned toolchain.
+- Add opt-in per-isolate memory budgets for statically configured and dynamically loaded JavaScript Workers. Retire an exceeded isolate, cancel unfinished work when required, and reload it for later requests.
+- Support Workers RPC and streaming tail sessions while a memory budget is active, including cancellation and bounded delivery of the memory-exceeded outcome. Durable Objects, Workflows, and other unmanaged CustomEvents remain unsupported with this budget. The budget measures V8 heap and external memory, not process RSS.
+- Build and test Linux AMD64 and ARM64 natively, with CPU, memory, dynamic Worker isolation, and packaging checks in the release gate. Publish upstream-compatible Linux executable names.
 
 ## 1.20260920.1-krun.0
 
