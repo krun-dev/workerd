@@ -1,20 +1,20 @@
-diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
-index 19dbb4c..0828684 100644
---- a/src/workerd/server/BUILD.bazel
-+++ b/src/workerd/server/BUILD.bazel
-@@ -275,6 +275,7 @@ wd_cc_library(
-     ],
-     hdrs = [
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 62534b9ce..0449d8117 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -28,6 +28,7 @@ wd_cc_library(
+     name = "worker-factory",
+     srcs = [
          "experimental-cpu-limit.h",
 +        "experimental-memory-limit.h",
-         "server.h",
-     ],
-     deps = [
-diff --git a/src/workerd/server/experimental-memory-limit.h b/src/workerd/server/experimental-memory-limit.h
+         "worker-factory.c++",
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+diff --git a/src/workerd/server/factory/experimental-memory-limit.h b/src/workerd/server/factory/experimental-memory-limit.h
 new file mode 100644
-index 0000000..d8e4f05
+index 000000000..d8e4f05c1
 --- /dev/null
-+++ b/src/workerd/server/experimental-memory-limit.h
++++ b/src/workerd/server/factory/experimental-memory-limit.h
 @@ -0,0 +1,407 @@
 +#pragma once
 +
@@ -423,30 +423,41 @@ index 0000000..d8e4f05
 +}
 +
 +}  // namespace workerd::server
-diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
-index 3c2835e..df16dce 100644
---- a/src/workerd/server/server.c++
-+++ b/src/workerd/server/server.c++
+diff --git a/src/workerd/server/factory/worker-factory-impl.h b/src/workerd/server/factory/worker-factory-impl.h
+index a6fa52bfd..607477e68 100644
+--- a/src/workerd/server/factory/worker-factory-impl.h
++++ b/src/workerd/server/factory/worker-factory-impl.h
 @@ -7,6 +7,7 @@
- #include "alarm-scheduler.h"
- #include "container-client.h"
- #include "experimental-cpu-limit.h"
+ // The private state behind worker-factory.h, shared by the factory's source files.
+ 
+ #include "worker-factory.h"
 +#include "experimental-memory-limit.h"
- #include "pyodide.h"
- #include "workerd-api.h"
  
-@@ -3303,14 +3304,23 @@ class SequentialSpanSubmitter final: public SpanSubmitter {
-   kj::EntropySource& entropySource;
- };
- 
--// IsolateLimitEnforcer that enforces no limits.
--class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-+// Standalone server limits; experimental budgets are opt-in.
-+class ServerIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ #include <workerd/api/bench.h>
+ #include <workerd/io/actor-sqlite.h>
+@@ -173,9 +174,11 @@ class WorkerTimerChannel final: public TimerChannel {
+ class CompiledWorker::Impl final: public kj::Refcounted, private kj::TaskSet::ErrorHandler {
   public:
-+  explicit ServerIsolateLimitEnforcer(kj::Own<ExperimentalMemoryBudget> memory)
+   Impl(const WorkerFactory& factory, kj::String name);
++  ~Impl() noexcept(false);
+ 
+   const WorkerFactory& factory;
+   kj::String name;
++  kj::Own<ExperimentalMemoryBudget> memory;
+   WorkerTimerChannel timerChannel;
+   kj::TaskSet waitUntilTasks;
+ 
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index a0e60662b..b04757b48 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -280,10 +280,19 @@ namespace {
+ 
+ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+  public:
++  explicit NullIsolateLimitEnforcer(kj::Own<ExperimentalMemoryBudget> memory)
 +      : memory(kj::mv(memory)) {}
-+  ~ServerIsolateLimitEnforcer() noexcept(false) {
++  ~NullIsolateLimitEnforcer() noexcept(false) {
 +    memory->disposed();
 +  }
    v8::Isolate::CreateParams getCreateParams() override {
@@ -454,17 +465,16 @@ index 3c2835e..df16dce 100644
 +    v8::Isolate::CreateParams params;
 +    memory->configure(params);
 +    return params;
-   }
- 
--  void customizeIsolate(v8::Isolate* isolate) override {}
++  }
 +  void customizeIsolate(v8::Isolate* isolate) override {
 +    memory->install(isolate);
-+  }
- 
+   }
+-  void customizeIsolate(v8::Isolate* isolate) override {}
    ActorCacheSharedLruOptions getActorCacheLruOptions() override {
-     // TODO(someday): Make this configurable?
-@@ -3327,11 +3337,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
- 
+     return {.softLimit = 16 * (1ull << 20),
+       .hardLimit = 128 * (1ull << 20),
+@@ -295,11 +304,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   }
    kj::Own<void> enterStartupJs(
        jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
 +    kj::Own<void> cpu;
@@ -477,10 +487,10 @@ index 3c2835e..df16dce 100644
 +    if (!memory->enabled()) return cpu;
 +    return kj::heap<MemoryStartupScope>(*memory, lock, result, kj::mv(cpu));
    }
- 
    kj::Own<void> enterStartupPython(
-@@ -3341,11 +3352,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
- 
+       jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
+@@ -307,11 +317,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   }
    kj::Own<void> enterDynamicImportJs(
        jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
 +    kj::Own<void> cpu;
@@ -493,29 +503,27 @@ index 3c2835e..df16dce 100644
 +    if (!memory->enabled()) return cpu;
 +    return kj::heap<MemoryStartupScope>(*memory, lock, result, kj::mv(cpu));
    }
- 
-   kj::Own<void> enterLoggingJs(
-@@ -3361,7 +3373,9 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   kj::Own<void> enterLoggingJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
+     return {};
+@@ -322,20 +333,23 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   }
    void completedRequest(kj::StringPtr id) const override {}
- 
    bool exitJs(jsg::Lock& lock) const override {
 -    return false;
 +    memory->check(lock.v8Isolate);
 +    memory->publish();
 +    return memory->exceeded();
    }
- 
    void reportMetrics(IsolateObserver& isolateMetrics) const override {}
-@@ -3372,7 +3386,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+   kj::Maybe<size_t> checkPbkdfIterations(jsg::Lock& lock, size_t iterations) const override {
+     return kj::none;
    }
- 
    bool hasExcessivelyExceededHeapLimit() const override {
 -    return false;
 +    return memory->exceeded();
    }
- 
    const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
-@@ -3380,6 +3394,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+     return trackedWasmInstances;
    }
  
   private:
@@ -523,190 +531,18 @@ index 3c2835e..df16dce 100644
    TrackedWasmInstanceList trackedWasmInstances;
  };
  
-@@ -3486,6 +3501,7 @@ class Server::WorkerService final: public Service,
-       ThreadContext& threadContext,
-       const kj::MonotonicClock& monotonicClock,
-       kj::Own<const Worker> worker,
-+      kj::Own<ExperimentalMemoryBudget> memory,
-       kj::Maybe<kj::HashSet<kj::String>> defaultEntrypointHandlers,
-       kj::HashMap<kj::String, kj::HashSet<kj::String>> namedEntrypoints,
-       kj::HashSet<kj::String> actorClassEntrypointsParam,
-@@ -3502,6 +3518,7 @@ class Server::WorkerService final: public Service,
-         threadContext(threadContext),
-         monotonicClock(monotonicClock),
-         ioChannels(kj::mv(linkCallback)),
-+        memory(kj::mv(memory)),
-         worker(kj::mv(worker)),
-         defaultEntrypointHandlers(kj::mv(defaultEntrypointHandlers)),
-         namedEntrypoints(kj::mv(namedEntrypoints)),
-@@ -3513,7 +3530,55 @@ class Server::WorkerService final: public Service,
-         containerEgressInterceptorImage(kj::mv(containerEgressInterceptorImageParam)),
-         isDynamic(isDynamic),
-         abortIsolateCallback(kj::mv(abortIsolateCallback)),
--        accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {}
-+        accessBlobHeaderName(kj::mv(accessBlobHeaderNameParam)) {
-+    persistentSelfTokens = selfTokensArePersistent();
-+    if (this->memory->enabled()) {
-+      this->memory->startServing();
-+      memoryCleanup = retireForMemory().fork();
-+    }
-+  }
-+  ~WorkerService() noexcept(false) {
-+    memory->disarmWatchdog();
-+  }
-+
-+  using MemoryReload = kj::Function<kj::Promise<kj::Own<WorkerService>>()>;
-+  void setMemoryReload(MemoryReload reload) {
-+    if (memory->enabled()) memoryReload = kj::mv(reload);
-+  }
-+
-+  // Owned by this service; the coroutine is canceled before its dependencies are destroyed.
-+  kj::Promise<void> retireForMemory() {
-+    co_await memory->onRetired();
-+    if (!memory->exceeded()) {
-+      auto drained = memory->onIdle().then([this]() { return waitUntilTasks.onEmpty(); });
-+      co_await drained
-+          .exclusiveJoin(threadContext.getUnsafeTimer().afterDelay(memory->remainingGrace()))
-+          .exclusiveJoin(memory->onStopped().catch_([](kj::Exception&&) {}));
-+    }
-+    memory->revokeAll();
-+    unlink();
-+    worker = nullptr;
-+  }
-+
-+  // The configured service is a stable routing address. It retains only the newest generation;
-+  // retired generations never form a forwarding chain. Rebuilds share one promise.
-+  kj::Promise<void> reloadAfterMemoryRetirement() {
-+    KJ_DEFER(memoryReloadPending = false);
-+    auto& generation = memoryReplacement.get() == nullptr ? *this : *memoryReplacement;
-+    co_await generation.memoryCleanup.addBranch();
-+    auto fresh = co_await KJ_ASSERT_NONNULL(memoryReload)();
-+    fresh->memoryReload = kj::none;
-+    memoryReplacement = kj::mv(fresh);
-+  }
-+
-+  kj::Promise<void> ensureMemoryGeneration() {
-+    if (!memoryReloadPending) {
-+      memoryReloadPending = true;
-+      memoryReloadTask = reloadAfterMemoryRetirement().fork();
-+    }
-+    // Do not reset the shared task while other callers still await their branches.
-+    co_await memoryReloadTask.addBranch();
-+  }
+@@ -381,7 +395,10 @@ kj::Own<IsolateObserver> newIsolateObserver(const WorkerFactory::Options& option
  
-   // Call immediately after the constructor to set up `actorNamespaces`. This can't happen during
-   // the constructor itself since it sets up cyclic references, which will throw an exception if
-@@ -3677,6 +3742,7 @@ class Server::WorkerService final: public Service,
-   }
- 
-   void unlink() override {
-+    if (memoryReplacement.get() != nullptr) memoryReplacement->unlink();
-     // Need to remove all waited until tasks before destroying `ioChannels`
-     waitUntilTasks.clear();
- 
-@@ -3718,6 +3784,7 @@ class Server::WorkerService final: public Service,
-   // Get whether self-tokens should be persistent, which is the case if the
-   // `allow_irrevocable_stub_storage` compat flag is set.
-   Persistent selfTokensArePersistent() {
-+    if (worker.get() == nullptr) return persistentSelfTokens;
-     return Persistent(
-         worker->getIsolate().getApi().getFeatureFlags().getAllowIrrevocableStubStorage());
-   }
-@@ -3885,6 +3952,31 @@ class Server::WorkerService final: public Service,
-       kj::Maybe<kj::Own<Worker::Actor>> actor,
-       bool isTracer,
-       kj::Maybe<kj::Own<AccessInfo>> accessInfo) {
-+    if (memory->enabled()) {
-+      auto& generation = memoryReplacement.get() == nullptr ? *this : *memoryReplacement;
-+      if (generation.memory->isRetiring()) {
-+        if (memoryReload == kj::none) {
-+          return wrapExperimentalMemoryInterface(
-+              WorkerInterface::fromException(memoryBudgetException()), *generation.memory,
-+              threadContext.getHeaderTable());
-+        }
-+        // Own the service and entrypoint name while queued. Cancellation releases the waiter;
-+        // the service-owned reload still completes for other requests.
-+        auto name = entrypointName.map([](kj::StringPtr n) { return kj::str(n); });
-+        return newPromisedWorkerInterface(ensureMemoryGeneration().then(
-+            [self = kj::addRef(*this), metadata = kj::mv(metadata), name = kj::mv(name),
-+                props = kj::mv(props), actor = kj::mv(actor), isTracer,
-+                accessInfo = kj::mv(accessInfo)]() mutable {
-+          return self->createEntrypoint(kj::mv(metadata),
-+              name.map([](kj::String& n) -> kj::StringPtr { return n; }), kj::mv(props),
-+              kj::mv(actor), isTracer, kj::mv(accessInfo));
-+        }));
-+      }
-+      if (&generation != this) {
-+        return generation.createEntrypoint(kj::mv(metadata), entrypointName, kj::mv(props),
-+            kj::mv(actor), isTracer, kj::mv(accessInfo));
-+      }
-+    }
-     auto& channels = KJ_ASSERT_NONNULL(ioChannels.tryGet<LinkedIoChannels>());
- 
-     kj::Vector<kj::Own<WorkerInterface>> bufferedTailWorkers(channels.tails.size());
-@@ -4008,17 +4100,20 @@ class Server::WorkerService final: public Service,
-     requestLimits =
-         wrapExperimentalCpuLimiter(kj::mv(requestLimits), serviceName.orDefault("<dynamic>"));
- #endif
--    return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
--        kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},  // ioContextDependency
--        addRefToThis(), kj::mv(observer), waitUntilTasks,
--        true,                  // tunnelExceptions
--        kj::mv(workerTracer),  // workerTracer
--        kj::mv(metadata.cfBlobJson),
--        kj::none,  // versionInfo
--        kj::mv(triggerContext),
--        false,  // isDynamicDispatch
--        kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
--        kj::mv(metadata.clientAddress));
-+    auto entrypoint =
-+        newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
-+            kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},  // ioContextDependency
-+            addRefToThis(), kj::mv(observer), waitUntilTasks,
-+            true,                  // tunnelExceptions
-+            kj::mv(workerTracer),  // workerTracer
-+            kj::mv(metadata.cfBlobJson),
-+            kj::none,  // versionInfo
-+            kj::mv(triggerContext),
-+            false,  // isDynamicDispatch
-+            kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory),
-+            metadata.fromPersistentStub, kj::mv(metadata.clientAddress));
-+    return wrapExperimentalMemoryInterface(
-+        kj::mv(entrypoint), *memory, threadContext.getHeaderTable());
-   }
- 
-  private:
-@@ -4253,7 +4348,9 @@ class Server::WorkerService final: public Service,
-   // LinkedIoChannels owns the SqliteDatabase::Vfs, so make sure it is destroyed last.
-   kj::OneOf<LinkCallback, LinkedIoChannels> ioChannels;
- 
-+  kj::Own<ExperimentalMemoryBudget> memory;
-   kj::Own<const Worker> worker;
-+  Persistent persistentSelfTokens = Persistent::NO;
-   kj::Maybe<kj::HashSet<kj::String>> defaultEntrypointHandlers;
-   kj::HashMap<kj::String, kj::HashSet<kj::String>> namedEntrypoints;
-   kj::HashSet<kj::String> actorClassEntrypoints;
-@@ -4267,6 +4364,11 @@ class Server::WorkerService final: public Service,
-   kj::Maybe<kj::Function<void()>> abortIsolateCallback;
-   kj::Maybe<kj::String> accessBlobHeaderName;
-   kj::Maybe<kj::uint> accessBindingServiceChannel;
-+  kj::Maybe<MemoryReload> memoryReload;
-+  kj::Own<WorkerService> memoryReplacement;
-+  bool memoryReloadPending = false;
-+  kj::ForkedPromise<void> memoryCleanup = nullptr;
-+  kj::ForkedPromise<void> memoryReloadTask = nullptr;
- 
-   // ---------------------------------------------------------------------------
-   // implements kj::TaskSet::ErrorHandler
-@@ -4636,6 +4738,7 @@ class Server::WorkerService final: public Service,
-   // No limits are enforced.
- 
+ class NullLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
+  public:
++  explicit NullLimitEnforcer(kj::Own<ExperimentalMemoryBudget> memory)
++      : memory(kj::mv(memory)) {}
    kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
 +    requireLimitsNotExceeded();
      return {};
    }
    void topUpActor() override {}
-@@ -4655,13 +4758,16 @@ class Server::WorkerService final: public Service,
+@@ -401,13 +418,17 @@ class NullLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
      return kj::maxValue;
    }
    kj::Maybe<EventOutcome> getLimitsExceeded() override {
@@ -715,9 +551,10 @@ index 3c2835e..df16dce 100644
    }
    kj::Promise<void> onLimitsExceeded() override {
 -    return kj::NEVER_DONE;
++    if (!memory->enabled()) return kj::NEVER_DONE;
 +    return memory->onStopped();
    }
-   void setCpuLimitNearlyExceededCallback(kj::Function<void(void)> cb) override {}
+   void setCpuLimitNearlyExceededCallback(kj::Function<void()> cb) override {}
 -  void requireLimitsNotExceeded() override {}
 +  void requireLimitsNotExceeded() override {
 +    if (memory->exceeded()) kj::throwFatalException(memoryBudgetException());
@@ -725,46 +562,405 @@ index 3c2835e..df16dce 100644
    void reportMetrics(RequestObserver& requestMetrics) override {}
    kj::Duration consumeTimeElapsedForPeriodicLogging() override {
      return 0 * kj::SECONDS;
-@@ -5726,7 +5832,17 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
-   }(),
-   };
+@@ -415,6 +436,9 @@ class NullLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
+   size_t getSqliteMemoryUsage() const override {
+     return 0;
+   }
++
++ private:
++  kj::Own<ExperimentalMemoryBudget> memory;
+ };
  
--  co_return co_await makeWorkerImpl(name, kj::mv(def), extensions, errorReporter);
-+  auto service = co_await makeWorkerImpl(name, kj::mv(def), extensions, errorReporter);
-+  // Config readers are owned by Server for its whole lifetime, including lazy reloads.
-+  service->setMemoryReload(
-+      [this, name = kj::str(name), conf, extensions]() -> kj::Promise<kj::Own<WorkerService>> {
-+    auto base = co_await makeWorker(name, conf, extensions);
-+    auto fresh = base.downcast<WorkerService>();
-+    ConfigErrorReporter reporter(*this, name);
-+    fresh->link(reporter);
-+    co_return fresh;
-+  });
-+  co_return service;
+ // Records a request's outcome on its tracer, wrapping the WorkerInterface to observe failures.
+@@ -1156,16 +1180,19 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+   }
+ 
+   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
+-  kj::Own<LimitEnforcer> requestLimits = kj::refcounted<NullLimitEnforcer>();
++  kj::Own<LimitEnforcer> requestLimits =
++      kj::refcounted<NullLimitEnforcer>(kj::addRef(*worker.memory));
+ #if __linux__
+   requestLimits = wrapExperimentalCpuLimiter(kj::mv(requestLimits), "<worker>");
+ #endif
+-  return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
++  auto entrypoint = newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
+       entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},
+       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
+       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
+       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
+       kj::mv(metadata.clientAddress));
++  return wrapExperimentalMemoryInterface(
++      kj::mv(entrypoint), *worker.memory, threadContext.getHeaderTable());
  }
  
- kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr name,
-@@ -5738,7 +5854,10 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
+ }  // namespace
+@@ -1402,9 +1429,14 @@ kj::Own<ActorIdHandle> actor_id_from_hex(::rust::Str hex) {
+ CompiledWorker::Impl::Impl(const WorkerFactory& factory, kj::String name)
+     : factory(factory),
+       name(kj::mv(name)),
++      memory(kj::refcounted<ExperimentalMemoryBudget>(this->name)),
+       timerChannel(factory.getImpl().timer, factory.getImpl().monotonicClock),
+       waitUntilTasks(*this) {}
  
-   auto jsgobserver = kj::atomicRefcounted<JsgIsolateObserver>();
-   auto observer = kj::atomicRefcounted<IsolateObserver>();
--  auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
-+  auto memory = kj::refcounted<ExperimentalMemoryBudget>(name);
-+  KJ_REQUIRE(!memory->enabled() || def.localActorConfigs.size() == 0,
++CompiledWorker::Impl::~Impl() noexcept(false) {
++  memory->disarmWatchdog();
++}
++
+ void CompiledWorker::Impl::taskFailed(kj::Exception&& exception) {
+   KJ_LOG(ERROR, exception);
+ }
+@@ -1712,7 +1744,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+   // The isolate of the Worker, or of the zygote that snapshots its startup.
+   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
+                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+-    auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
++    auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>(kj::addRef(*impl->memory));
+     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
+       return Worker::Api::InboundListener{
+         .protocol = kj::str(listener.protocol),
+@@ -1751,7 +1783,8 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+   kj::Maybe<jsg::SnapshotConfig> snapshotConfig;
+   // Not with a module fallback service either: the zygote has none, so a top level that tolerates
+   // a failed import (`try { await import(x) } catch {}`) would bake the failure in.
+-  if (util::Autogate::isEnabled(util::AutogateKey::STARTUP_SNAPSHOT) && !inspectorConfigured &&
++  if (!impl->memory->enabled() &&
++      util::Autogate::isEnabled(util::AutogateKey::STARTUP_SNAPSHOT) && !inspectorConfigured &&
+       moduleFallback == kj::none &&
+       supportsStartupSnapshot(impl->name, featureFlags, workerSource, envGlobals)) {
+     // The zygote reports into a reporter of its own: its failures must never surface as the
+@@ -1888,6 +1921,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+         : 0,
+     .env_actor_classes = static_cast<uint32_t>(impl->actorClassChannels.size()),
+   };
++  KJ_REQUIRE(!impl->memory->enabled() ||
++          (impl->info.actor_classes.empty() && impl->info.workflow_classes.empty()),
 +      "Experimental memory budgets currently support stateless workers only");
-+  auto limitEnforcer = kj::refcounted<ServerIsolateLimitEnforcer>(kj::addRef(*memory));
+   impl->worker = kj::mv(worker);
+   co_return kj::heap<CompiledWorker>(kj::mv(impl));
+ }
+@@ -1957,6 +1993,40 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
+   });
+ }
  
-   // Create the FsMap that will be used to map known file system
-   // roots to configurable locations.
-@@ -6160,8 +6279,10 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
-   kj::Maybe<kj::StringPtr> serviceName;
-   if (!def.isDynamic) serviceName = name;
++kj::Own<CompiledWorker> worker_clone(const CompiledWorker& worker) {
++  return kj::heap<CompiledWorker>(kj::addRef(worker.getImpl()));
++}
++
++bool worker_memory_enabled(const CompiledWorker& worker) {
++  return worker.getImpl().memory->enabled();
++}
++
++bool worker_memory_retiring(const CompiledWorker& worker) {
++  return worker.getImpl().memory->isRetiring();
++}
++
++void worker_memory_start_serving(const CompiledWorker& worker) {
++  worker.getImpl().memory->startServing();
++}
++
++kj::Promise<void> worker_memory_retire(const CompiledWorker& worker) {
++  auto impl = kj::addRef(worker.getImpl());
++  auto& memory = *impl->memory;
++  co_await memory.onRetired();
++  if (!memory.exceeded()) {
++    auto drained = memory.onIdle().then([impl = kj::addRef(*impl)]() {
++      return impl->waitUntilTasks.onEmpty();
++    });
++    co_await drained
++        .exclusiveJoin(impl->factory.getImpl().threadContext.getUnsafeTimer().afterDelay(
++            memory.remainingGrace()))
++        .exclusiveJoin(memory.onStopped().catch_([](kj::Exception&&) {}));
++  }
++  memory.revokeAll();
++  worker_unlink(worker);
++  impl->worker = kj::none;
++}
++
+ void worker_unlink(const CompiledWorker& worker) {
+   auto& impl = worker.getImpl();
+   impl.waitUntilTasks.clear();
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index 1c24d96d8..68f6758d9 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -219,6 +219,11 @@ class CompiledWorker final {
+ WorkerInfo worker_info(const CompiledWorker& worker);
+ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
+ void worker_unlink(const CompiledWorker& worker);
++kj::Own<CompiledWorker> worker_clone(const CompiledWorker& worker);
++bool worker_memory_enabled(const CompiledWorker& worker);
++bool worker_memory_retiring(const CompiledWorker& worker);
++void worker_memory_start_serving(const CompiledWorker& worker);
++kj::Promise<void> worker_memory_retire(const CompiledWorker& worker);
+ kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
+     kj::Maybe<::rust::Str> entrypoint,
+     kj::Maybe<kj::Own<Frankenvalue>> props,
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index 5b64b1fa8..7ddaa75c4 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -392,6 +392,11 @@ pub mod ffi {
+         /// channels; and drops a dynamic worker's env channel tables and tails, which may refer
+         /// back to the worker that loaded it. Called when the server unlinks the worker.
+         fn worker_unlink(worker: &CompiledWorker);
++        fn worker_clone(worker: &CompiledWorker) -> KjOwn<CompiledWorker>;
++        fn worker_memory_enabled(worker: &CompiledWorker) -> bool;
++        fn worker_memory_retiring(worker: &CompiledWorker) -> bool;
++        fn worker_memory_start_serving(worker: &CompiledWorker);
++        async fn worker_memory_retire(worker: &CompiledWorker) -> Result<()>;
+         /// Starts a request on the worker. `channels` is the worker's I/O channel table for this
+         /// request; `tails` receive the request's trace once it completes (the server passes none
+         /// for a request that is itself a tail worker's, so that tails do not trace themselves,
+diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
+index b98a5b0c6..b67e1f8cc 100644
+--- a/src/workerd/server/server/worker.rs
++++ b/src/workerd/server/server/worker.rs
+@@ -17,10 +17,13 @@ use std::ptr;
+ use std::rc::Rc;
+ use std::rc::Weak;
  
-+  KJ_REQUIRE(!memory->enabled() || errorReporter.actorClasses.size() == 0,
-+      "Experimental memory budgets do not yet support Durable Object classes");
-   auto result = kj::refcounted<WorkerService>(channelTokenHandler, serviceName,
--      globalContext->threadContext, monotonicClock, kj::mv(worker),
-+      globalContext->threadContext, monotonicClock, kj::mv(worker), kj::mv(memory),
-       kj::mv(errorReporter.defaultEntrypoint), kj::mv(errorReporter.namedEntrypoints),
-       kj::mv(errorReporter.actorClasses), kj::mv(linkCallback),
-       KJ_BIND_METHOD(*this, abortAllActors), KJ_BIND_METHOD(*this, deleteAllActors),
++use futures::FutureExt;
+ use futures::future::LocalBoxFuture;
++use futures::future::Shared;
+ use hashlink::LinkedHashMap;
+ use kj_rs::KjMaybe;
+ use kj_rs::KjOwn;
++use worker::Interface;
+ use workerd_capnp::service_designator;
+ use workerd_capnp::worker;
+ 
+@@ -65,6 +68,7 @@ use crate::config::invalid_config_error;
+ use crate::config::text;
+ use crate::loader::WorkerLoaderNamespace;
+ use crate::loader::dynamic_transfer_error;
++use crate::tasks::TaskHandle;
+ 
+ /// What the link stage resolves for a worker: every designator its config names, and the loopback
+ /// channels `ctx.exports` was numbered with.
+@@ -116,12 +120,16 @@ pub struct WorkerService {
+     factory: Rc<Factory>,
+     /// The service's name in the config; none for a dynamic worker, which no token can name.
+     service_name: Option<String>,
+-    worker: KjOwn<ffi::CompiledWorker>,
++    worker: RefCell<KjOwn<ffi::CompiledWorker>>,
++    retirement: RefCell<Option<Shared<LocalBoxFuture<'static, Result<()>>>>>,
++    retirement_task: RefCell<Option<TaskHandle>>,
++    reloading: RefCell<Option<Shared<LocalBoxFuture<'static, Result<()>>>>>,
++    reload_spec: Option<(u32, Rc<ffi::WorkerSpec>, Vec<u64>)>,
+     /// Under `workerd bench`, a config worker's index in the config's services and the spec it
+     /// was compiled from, from which throwaway copies are compiled to time startup. None
+     /// otherwise, since nothing else reads it and its bindings can be large, and for a dynamic
+     /// worker.
+-    config_spec: Option<(u32, ffi::WorkerSpec)>,
++    config_spec: Option<(u32, Rc<ffi::WorkerSpec>)>,
+     /// The default export's handlers, if the worker has a default export.
+     default_handlers: Option<HashSet<String>>,
+     /// Named exports with their handlers, in export order (loopback channels follow it).
+@@ -230,13 +238,21 @@ impl WorkerService {
+         .map_err(capnp_error)?;
+         ffi::worker_set_ctx_exports(&compiled, &loopback.globals)?;
+ 
++        let reload_globals = loopback.globals.clone();
+         let pending = pending_link(name, conf, bindings, loopback, report).map_err(capnp_error)?;
+-        let config_spec = ffi::is_bench_mode().then_some((service_index, spec));
++        let spec = Rc::new(spec);
++        let config_spec = ffi::is_bench_mode().then(|| (service_index, Rc::clone(&spec)));
++        let reload_spec = ffi::worker_memory_enabled(&compiled)
++            .then(|| (service_index, Rc::clone(&spec), reload_globals));
+ 
+         let this = Rc::new(Self {
+             factory,
+             service_name: Some(name.to_owned()),
+-            worker: compiled,
++            worker: RefCell::new(compiled),
++            retirement: RefCell::new(None),
++            retirement_task: RefCell::new(None),
++            reloading: RefCell::new(None),
++            reload_spec,
+             config_spec,
+             default_handlers,
+             named_entrypoints,
+@@ -250,6 +266,7 @@ impl WorkerService {
+             broken: Cell::new(false),
+         });
+         this.init_namespaces(local_actor_configs);
++        this.start_memory_monitor();
+         Ok(this)
+     }
+ }
+@@ -332,7 +349,11 @@ impl WorkerService {
+         let this = Rc::new(Self {
+             factory,
+             service_name: None,
+-            worker: compiled,
++            worker: RefCell::new(compiled),
++            retirement: RefCell::new(None),
++            retirement_task: RefCell::new(None),
++            reloading: RefCell::new(None),
++            reload_spec: None,
+             config_spec: None,
+             default_handlers,
+             named_entrypoints,
+@@ -374,6 +395,7 @@ impl WorkerService {
+             },
+             None,
+         )?;
++        this.start_memory_monitor();
+         Ok(this)
+     }
+ }
+@@ -723,6 +745,96 @@ impl WorkerService {
+ }
+ 
+ impl WorkerService {
++    fn start_memory_monitor(self: &Rc<Self>) {
++        let worker = ffi::worker_clone(&self.worker.borrow());
++        if !ffi::worker_memory_enabled(&worker) {
++            return;
++        }
++        ffi::worker_memory_start_serving(&worker);
++        let retirement =
++            async move { ffi::worker_memory_retire(&worker).await.map_err(Into::into) }
++                .boxed_local()
++                .shared();
++        let weak = Rc::downgrade(self);
++        let monitor = retirement.clone();
++        let task = self.factory.spawn(async move {
++            if monitor.await.is_ok() {
++                if let Some(service) = weak.upgrade() {
++                    if service.reload_spec.is_none() {
++                        if let Some(channels) = service.channels.borrow().as_ref() {
++                            if let Some(abort) = channels.abort_isolate.as_ref() {
++                                abort();
++                            }
++                        }
++                    }
++                }
++            }
++        });
++        *self.retirement.borrow_mut() = Some(retirement);
++        *self.retirement_task.borrow_mut() = Some(task);
++    }
++
++    fn memory_retiring(&self) -> bool {
++        ffi::worker_memory_retiring(&self.worker.borrow())
++    }
++
++    fn reload_after_memory_retirement(
++        self: &Rc<Self>,
++    ) -> Result<Shared<LocalBoxFuture<'static, Result<()>>>> {
++        if let Some(reloading) = self.reloading.borrow().as_ref() {
++            return Ok(reloading.clone());
++        }
++        let (index, spec, globals) = self
++            .reload_spec
++            .as_ref()
++            .ok_or_else(|| kj::failed!("dynamic worker was retired; load it again"))?;
++        let index = *index;
++        let spec = Rc::clone(spec);
++        let globals = globals.clone();
++        let retirement = self
++            .retirement
++            .borrow()
++            .as_ref()
++            .cloned()
++            .ok_or_else(|| kj::failed!("worker retirement is not monitored"))?;
++        let service = Rc::downgrade(self);
++        let reloading = async move {
++            let result = async {
++                retirement.await?;
++                let service = service
++                    .upgrade()
++                    .ok_or_else(|| kj::failed!("worker service is shutting down"))?;
++                let worker = ffi::factory_new_worker(
++                    service.factory.raw(),
++                    &spec,
++                    KjMaybe::Some(index),
++                    KjMaybe::None,
++                )
++                .await?;
++                let info = ffi::worker_info(&worker);
++                if !info.errors.is_empty() {
++                    return Err(kj::failed!(
++                        "reloading worker failed: {}",
++                        info.errors.join("\n")
++                    ));
++                }
++                ffi::worker_set_ctx_exports(&worker, &globals)?;
++                *service.worker.borrow_mut() = worker;
++                service.start_memory_monitor();
++                Ok(())
++            }
++            .await;
++            if let Some(service) = service.upgrade() {
++                service.reloading.borrow_mut().take();
++            }
++            result
++        }
++        .boxed_local()
++        .shared();
++        *self.reloading.borrow_mut() = Some(reloading.clone());
++        Ok(reloading)
++    }
++
+     /// The designators awaiting the link stage. Taken once, by the server's third pass.
+     pub fn take_pending_link(&self) -> Option<PendingLink> {
+         self.pending.borrow_mut().take()
+@@ -750,7 +862,10 @@ impl WorkerService {
+     /// Each is taken out of its cell before it is dropped, so that nothing a destructor reaches
+     /// finds the cell borrowed.
+     pub fn unlink(&self) {
+-        ffi::worker_unlink(&self.worker);
++        self.retirement_task.borrow_mut().take();
++        self.retirement.borrow_mut().take();
++        self.reloading.borrow_mut().take();
++        ffi::worker_unlink(&self.worker.borrow());
+         let namespaces = std::mem::take(&mut *self.namespaces.borrow_mut());
+         let channels = self.channels.borrow_mut().take();
+         drop((namespaces, channels));
+@@ -796,7 +911,7 @@ impl WorkerService {
+         };
+ 
+         ffi::worker_start_request(
+-            &self.worker,
++            &self.worker.borrow(),
+             entrypoint.into(),
+             props.into(),
+             actor.into(),
+@@ -890,6 +1005,16 @@ impl Channel for EntrypointChannel {
+         ffi::request_metadata_set_from_persistent_stub(metadata.as_mut(), self.persistent);
+         // A template called without props runs with empty props.
+         let props = self.props.as_deref().map(ffi::frankenvalue_clone);
++        if self.worker.memory_retiring() {
++            let ready = self.worker.reload_after_memory_retirement()?;
++            let service = Rc::clone(&self.worker);
++            let entrypoint = self.entrypoint.clone();
++            return Ok(worker::PromisedInterface::new(async move {
++                ready.await?;
++                service.start_request(entrypoint.as_deref(), props, None, metadata, false)
++            })
++            .into_kj());
++        }
+         self.worker
+             .start_request(self.entrypoint.as_deref(), props, None, metadata, false)
+     }
+@@ -950,7 +1075,7 @@ impl ActorClass for ActorClassImpl {
+         // A template used without props constructs the actor with empty props.
+         let props = self.props.as_deref().map(ffi::frankenvalue_clone);
+         ffi::worker_new_actor(
+-            &self.worker.worker,
++            &self.worker.worker.borrow(),
+             &self.class_name,
+             props.into(),
+             request.id,
+@@ -981,8 +1106,9 @@ impl ActorClass for ActorClassImpl {
+         Box::pin(async move {
+             let channels = self.worker.channels()?;
+             let tails = self.worker.start_tails(&channels, false)?;
++            let compiled = ffi::worker_clone(&self.worker.worker.borrow());
+             Ok(ffi::worker_run_actor_on_hibernate(
+-                &self.worker.worker,
++                &compiled,
+                 actor,
+                 &self.class_name,
+                 Box::new(ChannelFactory(channels)),

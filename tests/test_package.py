@@ -13,7 +13,25 @@ import distro
 
 
 class PackageTests(unittest.TestCase):
-    def test_compressed_binary_and_manifest(self):
+    def test_native_architectures_and_unsupported_hosts(self):
+        for value, expected in [
+                ('x86_64', ('amd64', 'x86_64', '64')),
+                ('amd64', ('amd64', 'x86_64', '64')),
+                ('aarch64', ('arm64', 'aarch64', 'arm64')),
+                ('arm64', ('arm64', 'aarch64', 'arm64'))]:
+            with self.subTest(machine=value), patch.object(distro.platform, 'machine', return_value=value):
+                self.assertEqual(distro.native_arch(), expected)
+        with patch.object(distro.platform, 'machine', return_value='riscv64'):
+            with self.assertRaisesRegex(RuntimeError, 'Unsupported build architecture'):
+                distro.native_arch()
+
+    def test_compressed_binary_and_manifest_amd64(self):
+        self.check_compressed_binary_and_manifest(('amd64', 'x86_64', '64'))
+
+    def test_compressed_binary_and_manifest_arm64(self):
+        self.check_compressed_binary_and_manifest(('arm64', 'aarch64', 'arm64'))
+
+    def check_compressed_binary_and_manifest(self, arch):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             build = root / '.build'
@@ -29,17 +47,18 @@ class PackageTests(unittest.TestCase):
             inputs = {'version': '1.20260916.1-krun.0'}
             digest = hashlib.sha256(binary).hexdigest()
             (build / 'build.json').write_text(json.dumps(dict(inputs, binary_sha256=digest,
-                    distro_dirty=False, distro_commit='abc')))
+                    distro_dirty=False, distro_commit='abc', platform=f'linux-{arch[1]}')))
             (build / 'test.json').write_text(json.dumps({'inputs': inputs, 'binary_sha256': digest}))
             with patch.multiple(distro, ROOT=root, BUILD=build, UPSTREAM=upstream), \
+                    patch.object(distro, 'native_arch', return_value=arch), \
                     patch.object(distro, 'inputs', return_value=inputs), \
                     patch.object(distro, 'output', side_effect=lambda args: 'abc' if args[1] == 'rev-parse' else ''):
                 distro.package()
-                self.assertEqual(gzip.decompress((root / 'dist/workerd-linux-64.gz').read_bytes()), binary)
+                self.assertEqual(gzip.decompress((root / f'dist/workerd-linux-{arch[2]}.gz').read_bytes()), binary)
                 manifest = next((root / 'dist').glob('*.sha256'))
                 entries = [line.split() for line in manifest.read_text().splitlines()]
                 self.assertEqual(len(entries), 4)
-                self.assertIn('workerd-linux-64.gz', [name for _, name in entries])
+                self.assertIn(f'workerd-linux-{arch[2]}.gz', [name for _, name in entries])
                 for checksum, name in entries:
                     self.assertEqual(hashlib.sha256((root / 'dist' / name).read_bytes()).hexdigest(), checksum)
                 (build / 'workerd-release').write_bytes(b'untested replacement')

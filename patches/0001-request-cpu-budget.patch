@@ -1,77 +1,20 @@
-diff --git a/src/workerd/server/BUILD.bazel b/src/workerd/server/BUILD.bazel
-index 79f727d..6bf6c56 100644
---- a/src/workerd/server/BUILD.bazel
-+++ b/src/workerd/server/BUILD.bazel
-@@ -222,6 +222,7 @@ wd_cc_library(
-         "server.c++",
-     ],
-     hdrs = [
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 63dfe2f50..62534b9ce 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -27,6 +27,7 @@ wd_cc_library(
+ wd_cc_library(
+     name = "worker-factory",
+     srcs = [
 +        "experimental-cpu-limit.h",
-         "server.h",
-     ],
-     deps = [
-diff --git a/src/workerd/server/server.c++ b/src/workerd/server/server.c++
-index 4f8bbda..512b90f 100644
---- a/src/workerd/server/server.c++
-+++ b/src/workerd/server/server.c++
-@@ -6,6 +6,7 @@
- 
- #include "alarm-scheduler.h"
- #include "container-client.h"
-+#include "experimental-cpu-limit.h"
- #include "pyodide.h"
- #include "workerd-api.h"
- 
-@@ -3301,8 +3302,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-   }
- 
-   kj::Own<void> enterStartupJs(
--      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
-+      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
-+#if __linux__
-+    return enterExperimentalStartupCpu(lock, result);
-+#else
-     return {};
-+#endif
-   }
- 
-   kj::Own<void> enterStartupPython(
-@@ -3311,8 +3316,12 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-   }
- 
-   kj::Own<void> enterDynamicImportJs(
--      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>&) const override {
-+      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
-+#if __linux__
-+    return enterExperimentalStartupCpu(lock, result);
-+#else
-     return {};
-+#endif
-   }
- 
-   kj::Own<void> enterLoggingJs(
-@@ -3964,10 +3973,13 @@ class Server::WorkerService final: public Service,
-       }
-     }
- 
-+    auto requestLimits = kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this));
-+#if __linux__
-+    requestLimits =
-+        wrapExperimentalCpuLimiter(kj::mv(requestLimits), serviceName.orDefault("<dynamic>"));
-+#endif
-     return newWorkerEntrypoint(threadContext, kj::atomicAddRef(*worker), entrypointName.clone(),
--        kj::mv(props), kj::mv(actor),
--        kj::attachRef(static_cast<LimitEnforcer&>(*this), kj::addRef(*this)),
--        {},  // ioContextDependency
-+        kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},  // ioContextDependency
-         addRefToThis(), kj::mv(observer), waitUntilTasks,
-         true,                  // tunnelExceptions
-         kj::mv(workerTracer),  // workerTracer
-diff --git a/src/workerd/server/experimental-cpu-limit.h b/src/workerd/server/experimental-cpu-limit.h
+         "worker-factory.c++",
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+diff --git a/src/workerd/server/factory/experimental-cpu-limit.h b/src/workerd/server/factory/experimental-cpu-limit.h
 new file mode 100644
-index 0000000..b4b6d36
+index 000000000..b4b6d36ec
 --- /dev/null
-+++ b/src/workerd/server/experimental-cpu-limit.h
++++ b/src/workerd/server/factory/experimental-cpu-limit.h
 @@ -0,0 +1,269 @@
 +// Experimental Linux-only host limiter. No V8 or workerd core changes.
 +#pragma once
@@ -342,3 +285,57 @@ index 0000000..b4b6d36
 +
 +}  // namespace workerd::server
 +#endif
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index adac4c8e8..a0e60662b 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -3,6 +3,7 @@
+ //     https://opensource.org/licenses/Apache-2.0
+ 
+ #include "worker-factory-impl.h"
++#include "experimental-cpu-limit.h"
+ 
+ #include <workerd/api/analytics-engine.capnp.h>
+ #include <workerd/api/trace.h>
+@@ -292,16 +293,25 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+       // In-memory-only actors: the cache never flushes to its (empty) backing storage.
+       .neverFlush = true};
+   }
+-  kj::Own<void> enterStartupJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++  kj::Own<void> enterStartupJs(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++#if __linux__
++    return enterExperimentalStartupCpu(lock, result);
++#else
+     return {};
++#endif
+   }
+   kj::Own<void> enterStartupPython(
+       jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
+     return {};
+   }
+   kj::Own<void> enterDynamicImportJs(
+-      jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& result) const override {
++#if __linux__
++    return enterExperimentalStartupCpu(lock, result);
++#else
+     return {};
++#endif
+   }
+   kj::Own<void> enterLoggingJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
+     return {};
+@@ -1146,8 +1156,12 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+   }
+ 
+   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
++  kj::Own<LimitEnforcer> requestLimits = kj::refcounted<NullLimitEnforcer>();
++#if __linux__
++  requestLimits = wrapExperimentalCpuLimiter(kj::mv(requestLimits), "<worker>");
++#endif
+   return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
+-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
++      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(requestLimits), {},
+       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
+       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
+       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
