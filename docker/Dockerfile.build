@@ -2,8 +2,13 @@ FROM ubuntu:24.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     python3 tcl git curl ca-certificates xz-utils unzip patch pkg-config \
     && rm -rf /var/lib/apt/lists/*
-RUN curl -fL https://releases.bazel.build/9.3.1/release/bazel-9.3.1-linux-x86_64 \
-    -o /usr/local/bin/bazel \
-    && echo '7f775b54bbec487efaf0f49ccda1d2ed02cd34f582edfdd6aeeec76e39ef585c  /usr/local/bin/bazel' | sha256sum -c - \
+ARG TARGETARCH
+RUN case "$TARGETARCH" in \
+      amd64) bazel_arch=x86_64; checksum=7f775b54bbec487efaf0f49ccda1d2ed02cd34f582edfdd6aeeec76e39ef585c ;; \
+      arm64) bazel_arch=arm64; checksum=10ba9cb76d4ee748d274dcc2981992bb12b74a203dc41a9c2eceeb8f29359366 ;; \
+      *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fL "https://releases.bazel.build/9.3.1/release/bazel-9.3.1-linux-$bazel_arch" -o /usr/local/bin/bazel \
+    && echo "$checksum  /usr/local/bin/bazel" | sha256sum -c - \
     && chmod +x /usr/local/bin/bazel
 WORKDIR /work
