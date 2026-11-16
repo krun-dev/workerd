@@ -448,7 +448,7 @@ index a6fa52bfd..607477e68 100644
    kj::TaskSet waitUntilTasks;
  
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index a0e60662b..b04757b48 100644
+index a0e60662b..99341b117 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
 @@ -280,10 +280,19 @@ namespace {
@@ -663,7 +663,7 @@ index a0e60662b..b04757b48 100644
 +  auto& memory = *impl->memory;
 +  co_await memory.onRetired();
 +  if (!memory.exceeded()) {
-+    auto drained = memory.onIdle().then([impl = kj::addRef(*impl)]() {
++    auto drained = memory.onIdle().then([impl = kj::addRef(*impl)]() mutable {
 +      return impl->waitUntilTasks.onEmpty();
 +    });
 +    co_await drained
