@@ -2,3 +2,4 @@
 0002-isolate-memory-budget.patch
 0003-cpu-usage-metrics.patch
 0004-loader-memory-metrics.patch
+0005-overlap-loader-memory-retirement.patch

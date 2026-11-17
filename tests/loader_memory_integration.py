@@ -1,4 +1,6 @@
 """Exercise memory retirement of dynamically loaded workers with the real runtime."""
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import http.client
 import json
 import os
@@ -18,6 +20,20 @@ let parent;
 let tailOnsets = 0;
 const tailOutcomes = [];
 const parentRetained = [];
+let rotationLoads = 0;
+let rotationQueued = 0;
+let gateOpen = false;
+let backgroundStarted = false;
+let backgroundDone = null;
+export class DrainGate extends WorkerEntrypoint {
+  async wait() {
+    backgroundStarted = true;
+    while (!gateOpen) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  done(id) {
+    backgroundDone = id;
+  }
+}
 export class Observer extends WorkerEntrypoint {
   tailStream(onset) {
     tailOnsets++;
@@ -40,19 +56,32 @@ const source = `
     }
   }
   let id;
+  let posts = 0;
   const retained = [];
   export default {
-    async fetch(request) {
+    async fetch(request, env, ctx) {
       id ??= crypto.randomUUID();
-      if (new URL(request.url).pathname.endsWith('/hold')) {
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/upload')) {
+        const invocation = ++posts;
+        return Response.json({ id, invocation, body: await request.text() });
+      }
+      if (path.endsWith('/posts')) return new Response(String(posts));
+      if (path.endsWith('/background')) {
+        ctx.waitUntil((async () => {
+          await env.GATE.wait();
+          await env.GATE.done(id);
+        })());
+      }
+      if (path.endsWith('/hold')) {
         await new Promise(resolve => setTimeout(resolve, 60000));
       }
-      if (new URL(request.url).pathname.endsWith('/hard-exceed')) {
+      if (path.endsWith('/hard-exceed')) {
         console.log('about to exceed memory');
         await new Promise(resolve => setTimeout(resolve, 100));
         retained.push(new Uint8Array(96 * 1024 * 1024).fill(1));
       }
-      if (new URL(request.url).pathname.endsWith('/allocate')) {
+      if (path.endsWith('/allocate')) {
         retained.push(new Uint8Array(4 * 1024 * 1024).fill(1));
       }
       return new Response(id);
@@ -72,15 +101,28 @@ export default {
       parentRetained.push(new Uint8Array(4 * 1024 * 1024).fill(1));
       return new Response('ok');
     }
+    if (path === '/rotation-status') {
+      return Response.json({ rotationLoads, rotationQueued, backgroundStarted, backgroundDone });
+    }
+    if (path === '/rotation-memory') return Response.json(env.LOADER.getMemoryUsage());
+    if (path === '/rotation-release') {
+      gateOpen = true;
+      return new Response('ok');
+    }
     const name = path.split('/')[1];
-    const loaded = await env.LOADER.get(name, () => ({
-      compatibilityDate: '2026-09-28',
-      mainModule: 'child.js',
-      modules: { 'child.js': { js: source } },
-      allowExperimental: true,
-      streamingTails: [ctx.exports.Observer({ props: {} })],
-      globalOutbound: null,
-    }));
+    if (path === '/rotation/queued') rotationQueued++;
+    const loaded = await env.LOADER.get(name, () => {
+      if (name === 'rotation') rotationLoads++;
+      return {
+        compatibilityDate: '2026-09-28',
+        mainModule: 'child.js',
+        modules: { 'child.js': { js: source } },
+        allowExperimental: true,
+        env: { GATE: ctx.exports.DrainGate({ props: {} }) },
+        streamingTails: [ctx.exports.Observer({ props: {} })],
+        globalOutbound: null,
+      };
+    });
     if (path.endsWith('/rpc-exceed')) {
       try {
         return new Response(String(await loaded.getEntrypoint('Rpc').hardExceed()));
@@ -115,6 +157,109 @@ def request(port, path):
         conn.close()
 
 
+@contextmanager
+def open_upload(port):
+    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=6)
+    try:
+        conn.putrequest('POST', '/rotation/upload')
+        conn.putheader('Content-Length', '7')
+        conn.endheaders()
+        yield conn
+    finally:
+        conn.close()
+
+
+def finish_upload(conn):
+    conn.send(b'payload')
+    response = conn.getresponse()
+    return response.status, json.loads(response.read())
+
+
+def wait_until(predicate, description):
+    deadline = time.monotonic() + 4
+    while not predicate():
+        if time.monotonic() >= deadline:
+            raise AssertionError(description)
+        time.sleep(.01)
+
+
+def rotation_checks(port):
+    budget = 64 * 1024 * 1024
+
+    def state():
+        status, body = request(port, '/rotation-status')
+        assert status == 200
+        return json.loads(body)
+
+    def memory_sample():
+        status, body = request(port, '/rotation-memory')
+        assert status == 200
+        samples = [row['bytes'] for row in json.loads(body) if row['id'] == 'rotation']
+        assert len(samples) == 1, samples
+        return samples[0]
+
+    def exhaust(generation, prior_bytes=0):
+        for _ in range(20):
+            assert request(port, '/rotation/allocate') == (200, generation)
+            used = memory_sample()
+            if used - prior_bytes > budget:
+                return used
+        raise AssertionError(f'generation {generation} did not cross the soft memory limit')
+
+    with open_upload(port) as first:
+        wait_until(lambda: request(port, '/rotation/posts') == (200, '1'),
+                   'first upload did not reach the Worker')
+        status, first_id = request(port, '/rotation/background')
+        assert status == 200
+        wait_until(lambda: state()['backgroundStarted'], 'waitUntil did not start')
+        first_bytes = exhaust(first_id)
+        status, second_id = request(port, '/rotation')
+        assert status == 200
+        assert second_id != first_id
+        assert state()['backgroundDone'] is None
+        overlap = memory_sample() > first_bytes
+
+        with open_upload(port) as second, ThreadPoolExecutor(max_workers=3) as pool:
+            wait_until(lambda: request(port, '/rotation/posts') == (200, '1'),
+                       'second upload did not reach the Worker')
+            exhaust(second_id, first_bytes)
+
+            queued = [pool.submit(request, port, '/rotation/queued') for _ in range(3)]
+            wait_until(lambda: state()['rotationQueued'] == len(queued),
+                       'replacement requests did not reach the Loader')
+            bounded = state()['rotationLoads'] == 2 and not any(f.done() for f in queued)
+
+            first_completed = finish_upload(first) == (
+                200, {'id': first_id, 'invocation': 1, 'body': 'payload'})
+            assert state()['backgroundDone'] is None
+            waits_for_background = not any(f.done() for f in queued)
+            assert request(port, '/rotation-release') == (200, 'ok')
+            wait_until(lambda: state()['backgroundDone'] == first_id,
+                       'retired generation lost its waitUntil task')
+
+            results = [f.result() for f in queued]
+            status, third_id = results[0]
+            single_startup = (status == 200 and third_id not in {first_id, second_id}
+                              and all(result == results[0] for result in results)
+                              and state()['rotationLoads'] == 3)
+            second_completed = finish_upload(second) == (
+                200, {'id': second_id, 'invocation': 1, 'body': 'payload'})
+
+        wait_until(lambda: 0 < memory_sample() < budget, 'drained generations still reported')
+        current_preserved = (request(port, '/rotation') == (200, third_id)
+                             and request(port, '/rotation/posts') == (200, '0')
+                             and state()['rotationLoads'] == 3)
+    return {
+        'replacement_serves_during_drain': overlap,
+        'accepted_post_finishes_on_original_generation': first_completed,
+        'second_accepted_post_finishes_on_original_generation': second_completed,
+        'post_bodies_are_not_replayed': current_preserved,
+        'accepted_wait_until_finishes_before_slot_reuse': waits_for_background,
+        'overlap_capped_at_two_generations': bounded,
+        'queued_requests_share_one_replacement': single_startup,
+    }
+
+
 with tempfile.TemporaryDirectory(prefix='krun-loader-memory-') as tmp:
     root = Path(tmp)
     listener = socket.socket()
@@ -124,7 +269,8 @@ with tempfile.TemporaryDirectory(prefix='krun-loader-memory-') as tmp:
     (root / 'entry.js').write_text(worker)
     (root / 'config.capnp').write_text(config.replace('PORT', str(port)))
     env = {key: value for key, value in os.environ.items() if not key.startswith('WORKERD_EXPERIMENTAL_')}
-    env.update(WORKERD_EXPERIMENTAL_MEMORY_MB='64', WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS='100')
+    env.update(WORKERD_EXPERIMENTAL_MEMORY_MB='64', WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS='5000',
+               WORKERD_EXPERIMENTAL_MEMORY_METRICS='1')
     with (root / 'workerd.log').open('w+') as log:
         proc = subprocess.Popen([binary, 'serve', 'config.capnp', '--experimental',
                                  f'--socket-fd=entry={listener.fileno()}'],
@@ -145,6 +291,7 @@ with tempfile.TemporaryDirectory(prefix='krun-loader-memory-') as tmp:
                 if time.monotonic() > deadline:
                     raise TimeoutError('workerd did not start')
                 time.sleep(.05)
+            rotation = rotation_checks(port)
             assert request(port, '/a')[0] == 200
             _, a_before = request(port, '/a')
             status, b_before = request(port, '/b')
@@ -168,6 +315,7 @@ with tempfile.TemporaryDirectory(prefix='krun-loader-memory-') as tmp:
                     pass
                 time.sleep(.05)
             checks = {
+                **rotation,
                 'tail_events_delivered': int(request(port, '/tails')[1]) > 0,
                 'successful_tail_outcome': any(event['outcome'] == 'ok' for event in json.loads(request(port, '/outcomes')[1])),
                 'child_reloaded': reloaded,
