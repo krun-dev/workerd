@@ -8,9 +8,14 @@ on:
         description: 'Publish VERSION after the Linux AMD64 build and tests pass'
         type: boolean
         default: false
+      reuse_run_id:
+        description: 'Reuse a verified AMD64 artifact from an identical source tree'
+        type: string
+        required: false
   push:
     tags: ['v*-krun.*']
 permissions:
+  actions: read
   contents: read
 concurrency:
   group: release-${{ github.ref }}
@@ -44,12 +49,13 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: test "$RELEASE_TAG" = "v$(cat VERSION)"
       - name: Make room on GitHub-hosted runners
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' && inputs.reuse_run_id == ''
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc
           docker image prune -af
           df -h .
       - name: Build, test and package
+        if: inputs.reuse_run_id == ''
         env:
           WORKERD_BUILD_JOBS: ${{ vars.WORKERD_BUILD_JOBS || '3' }}
           WORKERD_BUILD_MEMORY_MB: ${{ vars.WORKERD_BUILD_MEMORY_MB || '10000' }}
@@ -57,6 +63,41 @@ jobs:
         run: |
           if [ -n "$DISTRO_CACHE" ]; then export WORKERD_BUILD_CACHE="$DISTRO_CACHE"; fi
           python3 scripts/distro.py release
+      - name: Download previously verified AMD64 artifact
+        if: inputs.reuse_run_id != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: workerd-linux-x86_64
+          path: dist
+          run-id: ${{ inputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify reused source and artifacts
+        if: inputs.reuse_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REUSE_RUN: ${{ inputs.reuse_run_id }}
+        run: |
+          set -euo pipefail
+          run=$(gh api "repos/$GH_REPO/actions/runs/$REUSE_RUN")
+          test "$(jq -r .conclusion <<< "$run")" = success
+          test "$(jq -r .name <<< "$run")" = 'Build and release'
+          source_sha=$(jq -r .head_sha <<< "$run")
+          git fetch --no-tags origin "$source_sha"
+          git diff --exit-code "$source_sha" HEAD -- . ':!.github/workflows/release.yml'
+          cd dist
+          sha256sum -c *.sha256
+          jq -e --arg version "$(cat ../VERSION)" --arg sha "$source_sha" '.version == $version and .distro_commit == $sha and .distro_dirty == false' *.build-info.json
+          python3 - <<'PYCODE'
+          import glob, hashlib, json, gzip
+          build = json.load(open(glob.glob('*.build-info.json')[0]))
+          tests = json.load(open(glob.glob('*.test-info.json')[0]))
+          with gzip.open('workerd-linux-64.gz', 'rb') as f:
+              digest = hashlib.sha256(f.read()).hexdigest()
+          assert digest == build['binary_sha256'] == tests['binary_sha256']
+          for key in ('checks', 'memory_checks', 'loader_memory_checks'):
+              assert tests[key] and all(tests[key].values()), key
+          PYCODE
       - uses: actions/upload-artifact@v7
         with:
           name: workerd-linux-${{ matrix.arch }}
