@@ -14,6 +14,13 @@ on:
         required: false
   push:
     tags: ['v*-krun.*']
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - 'docker/Dockerfile.build'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'upstream/workerd'
 permissions:
   actions: read
   contents: read
@@ -54,15 +61,74 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc
           docker image prune -af
           df -h .
+      - name: Select Bazel cache
+        id: bazel_cache
+        if: runner.environment == 'github-hosted' && inputs.reuse_run_id == '' && vars.WORKERD_BUILD_CACHE == ''
+        env:
+          PLATFORM: ${{ matrix.runner }}-${{ matrix.arch }}
+          BUILDER: ${{ hashFiles('docker/Dockerfile.build', 'upstream/workerd/.bazelversion') }}
+        run: |
+          upstream=$(git -C upstream/workerd rev-parse HEAD)
+          echo "prefix=workerd-bazel-v1-$PLATFORM-$upstream-$BUILDER-" >> "$GITHUB_OUTPUT"
+      - name: Restore Bazel action cache
+        id: bazel_restore
+        if: steps.bazel_cache.outcome == 'success'
+        uses: actions/cache/restore@v6
+        continue-on-error: true
+        with:
+          path: .build/cache/actions
+          key: ${{ steps.bazel_cache.outputs.prefix }}${{ github.sha }}
+          restore-keys: ${{ steps.bazel_cache.outputs.prefix }}
       - name: Build, test and package
         if: inputs.reuse_run_id == ''
         env:
           WORKERD_BUILD_JOBS: ${{ vars.WORKERD_BUILD_JOBS || '3' }}
           WORKERD_BUILD_MEMORY_MB: ${{ vars.WORKERD_BUILD_MEMORY_MB || '10000' }}
           DISTRO_CACHE: ${{ vars.WORKERD_BUILD_CACHE }}
+          WORKERD_BUILD_ACTION_CACHE: ${{ steps.bazel_cache.outcome == 'success' && '1' || '0' }}
         run: |
           if [ -n "$DISTRO_CACHE" ]; then export WORKERD_BUILD_CACHE="$DISTRO_CACHE"; fi
           python3 scripts/distro.py release
+      - name: Bound Bazel cache snapshot
+        id: bazel_snapshot
+        if: >-
+          steps.bazel_cache.outcome == 'success' &&
+          steps.bazel_restore.outputs.cache-hit != 'true' &&
+          startsWith(github.ref, 'refs/heads/')
+        continue-on-error: true
+        run: |
+          python3 - <<'PYCODE'
+          import os
+          from pathlib import Path
+
+          cache = Path('.build/cache/actions')
+          # Leave room under GitHub's default 10 GiB repository quota for two snapshots.
+          budget = 4 * 1024**3
+          files = []
+          size = 0
+          for path in cache.rglob('*'):
+              if path.is_file():
+                  stat = path.stat()
+                  files.append((stat.st_mtime_ns, stat.st_size, path))
+                  size += stat.st_size
+          # Bazel treats entries whose referenced blobs have been evicted as cache misses.
+          for _, nbytes, path in sorted(files):
+              if size <= budget:
+                  break
+              path.unlink()
+              size -= nbytes
+          print(f'Bazel action cache snapshot: {size / 1024**3:.2f} GiB')
+          if size:
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  print('ready=true', file=output)
+          PYCODE
+      - name: Save Bazel action cache
+        if: steps.bazel_snapshot.outputs.ready == 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: .build/cache/actions
+          key: ${{ steps.bazel_cache.outputs.prefix }}${{ github.sha }}
       - name: Download previously verified AMD64 artifact
         if: inputs.reuse_run_id != ''
         uses: actions/download-artifact@v8
