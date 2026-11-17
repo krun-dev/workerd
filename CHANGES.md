@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Expose opt-in V8 heap and external memory samples for successfully started, named dynamic workers in a WorkerLoader namespace.
 - Report best-effort per-request execution-thread CPU time in streaming tail outcomes, with nanosecond transport precision and optional measurement without enforcement.
 - Update the pinned official workerd release to v1.20261116.1 and port the CPU and memory budget patches to its Rust/C++ server architecture and pinned toolchain.
 - Add opt-in per-isolate memory budgets for statically configured and dynamically loaded JavaScript Workers. Retire an exceeded isolate, cancel unfinished work when required, and reload it for later requests.
