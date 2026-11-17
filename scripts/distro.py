@@ -141,7 +141,10 @@ def build():
     flags = ['--repository_cache=/cache/repository',
              '--config=release_linux', '--strip=always',
              '--@v8//:v8_enable_pointer_compression_shared_cage=False',
-             f'--jobs={jobs}', f'--local_resources=memory={memory}', TARGET]
+             f'--jobs={jobs}', f'--local_resources=memory={memory}']
+    if os.environ.get('WORKERD_BUILD_ACTION_CACHE') == '1':
+        flags.append('--disk_cache=/cache/actions')
+    flags.append(TARGET)
     network = os.environ.get('WORKERD_BUILD_NETWORK', 'bridge')
     proxy_args = []
     for key in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',

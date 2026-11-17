@@ -69,6 +69,10 @@ python3 scripts/distro.py test
 
 构建从干净的官方源码应用补丁；发布流程要求测试通过，并核对源码、构建记录与被测试二进制的哈希。
 
+GitHub 托管 runner 使用 Actions Cache 保存 Bazel 编译产物。缓存按架构、上游版本和构建工具链复用，每个快照最多 4 GiB。`main` 上的构建更新可供其他分支和标签读取的缓存。每次构建仍会运行二进制回归测试。常驻 runner 可通过 `WORKERD_BUILD_CACHE` 使用自己的持久盘。
+
+同一份源码已经通过完整构建时，发版可通过 `reuse_run_id` 使用该次验证的制品。
+
 ## 目录结构
 
 ```text
