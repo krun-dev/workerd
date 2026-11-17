@@ -140,6 +140,7 @@ def build():
         raise RuntimeError('Use positive jobs and at least 1024 MiB build memory.')
     flags = ['--repository_cache=/cache/repository',
              '--config=release_linux', '--strip=always',
+             '--@v8//:v8_enable_pointer_compression_shared_cage=False',
              f'--jobs={jobs}', f'--local_resources=memory={memory}', TARGET]
     network = os.environ.get('WORKERD_BUILD_NETWORK', 'bridge')
     proxy_args = []
