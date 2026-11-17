@@ -15,6 +15,7 @@ on:
   push:
     tags: ['v*-krun.*']
 permissions:
+  actions: read
   contents: read
 concurrency:
   group: release-${{ github.ref }}
