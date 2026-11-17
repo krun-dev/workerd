@@ -198,6 +198,7 @@ def test(binary=None):
     shutil.copy2(ROOT / 'tests/memory_integration.py', directory / 'memory_integration.py')
     shutil.copy2(ROOT / 'tests/loader_memory_integration.py', directory / 'loader_memory_integration.py')
     shutil.copy2(ROOT / 'tests/cpu_metrics_integration.py', directory / 'cpu_metrics_integration.py')
+    shutil.copy2(ROOT / 'tests/memory_metrics_integration.py', directory / 'memory_metrics_integration.py')
     (BUILD / 'test.json').unlink(missing_ok=True)
     env = os.environ.copy()
     for key in list(env):
@@ -221,10 +222,15 @@ def test(binary=None):
     cpu_metrics = json.loads((directory / 'cpu-metrics-results.json').read_text())
     if len(cpu_metrics['checks']) != 5 or not all(cpu_metrics['checks'].values()):
         raise RuntimeError('CPU metrics integration checks failed.')
+    run([sys.executable, directory / 'memory_metrics_integration.py', binary], env=env)
+    memory_metrics = json.loads((directory / 'memory-metrics-results.json').read_text())
+    if len(memory_metrics['checks']) != 6 or not all(memory_metrics['checks'].values()):
+        raise RuntimeError('Memory metrics integration checks failed.')
     write_json(BUILD / 'test.json', {'binary_sha256': sha(binary), 'inputs': inputs(),
                                    'checks': results['checks'], 'memory_checks': memory['checks'],
                                    'loader_memory_checks': loader_memory['checks'],
                                    'cpu_metrics_checks': cpu_metrics['checks'],
+                                   'memory_metrics_checks': memory_metrics['checks'],
                                    'kernel': platform.release()})
 
 

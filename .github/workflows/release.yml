@@ -95,7 +95,7 @@ jobs:
           with gzip.open('workerd-linux-64.gz', 'rb') as f:
               digest = hashlib.sha256(f.read()).hexdigest()
           assert digest == build['binary_sha256'] == tests['binary_sha256']
-          for key in ('checks', 'memory_checks', 'loader_memory_checks'):
+          for key in ('checks', 'memory_checks', 'loader_memory_checks', 'cpu_metrics_checks', 'memory_metrics_checks'):
               assert tests[key] and all(tests[key].values()), key
           PYCODE
       - uses: actions/upload-artifact@v7

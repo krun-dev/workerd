@@ -12,6 +12,7 @@
 | 请求 CPU 指标 | 将执行线程的 CPU 时间写入 streaming tail 的 `outcome.cpuTime`（毫秒，支持小数），可单独启用，无需启用 CPU 预算。 |
 | 启动 CPU 预算 | 限制模块初始化及动态导入阶段的 JavaScript CPU 时间，避免初始化死循环。 |
 | isolate 内存预算 | 按 V8 报告的 JS 堆与外部内存计量，包括 ArrayBuffer backing store；同一 isolate 的并发请求共享额度，各 isolate 分别限制。 |
+| isolate 内存指标 | `WorkerLoader.getMemoryUsage()` 返回该 Loader 中具名 Worker 最近采集到的 V8 堆和外部内存字节数。采集可独立于限额开启。 |
 | 内存超限延迟销毁 | 旧实例停止接单，允许在途请求和后台任务在宽限期内完成，完成后提前清理；到期或内存继续增长超过紧急阈值时强制终止。没有后续请求也会清理旧实例。 |
 | 按需重新加载 | 内存超限实例清理后，后续请求通过原配置创建新实例，重新初始化全局状态；退出期间的新请求等待，并发请求共享一次重建。不会自动重放失败请求。 |
 | 连接与资源清理 | 强制取消在途任务、后台任务和可撤销连接，释放入口引用与 isolate；支持普通 HTTP、流式响应、WebSocket 和 service binding `fetch()` 的相关路径。 |
@@ -30,6 +31,7 @@
 | `WORKERD_EXPERIMENTAL_STARTUP_CPU_MS` | `1000` | 启动及动态导入 CPU 预算，单位 ms；仅在请求 CPU 预算开启时生效，范围 `1..3600000`。 |
 | `WORKERD_EXPERIMENTAL_CPU_POLL_MS` | `10` | CPU watchdog 检查间隔，单位 ms，范围 `1..100`；实际中断时间可能超过预算。 |
 | `WORKERD_EXPERIMENTAL_MEMORY_MB` | `0` | 每个 isolate 的内存预算，单位 MiB；`0` 关闭，开启时范围 `16..2048`。 |
+| `WORKERD_EXPERIMENTAL_MEMORY_METRICS` | `0` | 设置为 `1` 时，为动态 Worker 在启动、执行及 GC 的安全点采样，仅对本 Loader 中已启动的具名 Worker 返回数据。 |
 | `WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS` | `5000` | 内存超限后的最长等待时间，单位 ms，范围 `0..60000`；`0` 表示立即终止。 |
 
 例如，限制请求 CPU 时间为 50 ms、每个 isolate 内存为 128 MiB，并允许超限实例最多等待 5 秒：
