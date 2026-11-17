@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Build V8 with multiple pointer-compression cages so that independently created Worker isolate groups do not share one 4 GiB heap address space. Each group retains its own cage limit.
 - Expose opt-in V8 heap and external memory samples for successfully started, named dynamic workers in a WorkerLoader namespace.
 - Report best-effort per-request execution-thread CPU time in streaming tail outcomes, with nanosecond transport precision and optional measurement without enforcement.
 - Update the pinned official workerd release to v1.20261116.1 and port the CPU and memory budget patches to its Rust/C++ server architecture and pinned toolchain.
