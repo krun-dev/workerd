@@ -1,0 +1,311 @@
+diff --git a/src/workerd/api/worker-loader.c++ b/src/workerd/api/worker-loader.c++
+index 32a0c46..56b9386 100644
+--- a/src/workerd/api/worker-loader.c++
++++ b/src/workerd/api/worker-loader.c++
+@@ -123,6 +123,13 @@ jsg::Ref<WorkerStub> WorkerLoader::load(jsg::Lock& js, WorkerCode code) {
+   return js.alloc<WorkerStub>(ioctx.addObject(kj::mv(isolateChannel)));
+ }
+ 
++kj::Array<WorkerLoader::MemorySample> WorkerLoader::getMemoryUsage() {
++  auto samples = IoContext::current().getIoChannelFactory().getWorkerLoaderMemoryUsage(channel);
++  return KJ_MAP(sample, samples) {
++    return MemorySample{.id = kj::mv(sample.id), .bytes = static_cast<double>(sample.bytes)};
++  };
++}
++
+ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
+     IoContext& ioctx,
+     CompatibilityDateValidation compatDateValidation,
+diff --git a/src/workerd/api/worker-loader.h b/src/workerd/api/worker-loader.h
+index da5f4f8..613eccf 100644
+--- a/src/workerd/api/worker-loader.h
++++ b/src/workerd/api/worker-loader.h
+@@ -141,12 +141,22 @@ class WorkerLoader: public jsg::Object {
+   // Shortcut for `get(null, () => code)`.
+   jsg::Ref<WorkerStub> load(jsg::Lock& js, WorkerCode code);
+ 
++  struct MemorySample {
++    kj::String id;
++    double bytes;
++
++    JSG_STRUCT(id, bytes);
++  };
++
++  kj::Array<MemorySample> getMemoryUsage();
++
+   // A binding transfers through a startup snapshot as its channel number.
+   kj::Maybe<kj::Own<jsg::Wrappable>> snapshotClone() const override;
+ 
+   JSG_RESOURCE_TYPE(WorkerLoader) {
+     JSG_METHOD(get);
+     JSG_METHOD(load);
++    JSG_METHOD(getMemoryUsage);
+ 
+     JSG_TS_ROOT();
+   }
+@@ -170,6 +180,7 @@ class WorkerLoader: public jsg::Object {
+ 
+ #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
+   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
+-      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, workerd::ResourceLimits
++      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, api::WorkerLoader::MemorySample,   \
++      workerd::ResourceLimits
+ 
+ }  // namespace workerd::api
+diff --git a/src/workerd/io/io-channels.h b/src/workerd/io/io-channels.h
+index 758ac82..d6001f5 100644
+--- a/src/workerd/io/io-channels.h
++++ b/src/workerd/io/io-channels.h
+@@ -108,6 +108,11 @@ class TimerChannel {
+ };
+ 
+ class WorkerStubChannel;
++
++struct WorkerLoaderMemorySample {
++  kj::String id;
++  uint64_t bytes;
++};
+ struct DynamicWorkerSource;
+ 
+ // Each IoContext has a set of "channels" on which outgoing I/O can be initiated. All outgoing
+@@ -501,6 +506,10 @@ class IoChannelFactory: public virtual kj::Refcounted {
+     JSG_FAIL_REQUIRE(Error, "Dynamic worker loading is not supported by this runtime.");
+   }
+ 
++  virtual kj::Array<WorkerLoaderMemorySample> getWorkerLoaderMemoryUsage(uint) {
++    return {};
++  }
++
+   // Get the network for connecting to workerd debug ports.
+   // This is used by the workerdDebugPort binding to connect to remote workerd instances.
+   virtual kj::Network& getWorkerdDebugPortNetwork() {
+diff --git a/src/workerd/server/factory/experimental-memory-limit.h b/src/workerd/server/factory/experimental-memory-limit.h
+index 32c79e0..fb53f6f 100644
+--- a/src/workerd/server/factory/experimental-memory-limit.h
++++ b/src/workerd/server/factory/experimental-memory-limit.h
+@@ -69,6 +69,16 @@ class ExperimentalMemoryBudget final: public kj::Refcounted {
+   bool enabled() const {
+     return limit != 0;
+   }
++  void enableMetrics() {
++    auto value = std::getenv("WORKERD_EXPERIMENTAL_MEMORY_METRICS");
++    metrics = value != nullptr && kj::StringPtr(value) == "1"_kj;
++  }
++  bool tracking() const {
++    return enabled() || metrics;
++  }
++  uint64_t getSampledBytes() const {
++    return sampledBytes;
++  }
+   bool exceeded() const {
+     return stopped.load();
+   }
+@@ -136,17 +146,19 @@ class ExperimentalMemoryBudget final: public kj::Refcounted {
+     if (enabled()) params.constraints.ConfigureDefaultsFromHeapSize(0, limit + HEADROOM);
+   }
+   void install(v8::Isolate* isolate) {
+-    if (!enabled()) return;
++    if (!tracking()) return;
+     this->isolate = isolate;
+-    isolate->AddNearHeapLimitCallback(nearLimit, this);
++    if (enabled()) isolate->AddNearHeapLimitCallback(nearLimit, this);
+     isolate->AddGCEpilogueCallback(afterGc, this);
+   }
+   void check(v8::Isolate* isolate, bool terminate = false) {
+-    if (!enabled()) return;
++    if (!tracking()) return;
+     v8::HeapStatistics stats;
+     isolate->GetHeapStatistics(&stats);
+     // Registered external memory includes ArrayBuffer backing stores, not all native memory.
+     auto used = stats.used_heap_size() + stats.external_memory();
++    if (metrics) sampledBytes = used;
++    if (!enabled()) return;
+     if (used > limit) retire();
+     if (used > limit + HEADROOM) stopped.store(true);
+     if (exceeded() && terminate) isolate->TerminateExecution();
+@@ -179,6 +191,7 @@ class ExperimentalMemoryBudget final: public kj::Refcounted {
+   }
+   void disposed() {
+     isolate = nullptr;
++    sampledBytes = 0;
+     if (retiring) KJ_LOG(WARNING, "experimental memory limit: isolate disposed", name);
+   }
+ 
+@@ -222,6 +235,8 @@ class ExperimentalMemoryBudget final: public kj::Refcounted {
+   kj::List<Entry, &Entry::link> entries;
+   kj::String name;
+   v8::Isolate* isolate = nullptr;
++  bool metrics = false;
++  uint64_t sampledBytes = 0;
+   size_t limit = 0;
+   uint64_t graceMs = 5000;
+   uint requests = 0;
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 25f8c51..25cd4bc 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -308,7 +308,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ #if __linux__
+     cpu = enterExperimentalStartupCpu(lock, result);
+ #endif
+-    if (!memory->enabled()) return cpu;
++    if (!memory->tracking()) return cpu;
+     return kj::heap<MemoryStartupScope>(*memory, lock, result, kj::mv(cpu));
+   }
+   kj::Own<void> enterStartupPython(
+@@ -321,7 +321,7 @@ class NullIsolateLimitEnforcer final: public IsolateLimitEnforcer {
+ #if __linux__
+     cpu = enterExperimentalStartupCpu(lock, result);
+ #endif
+-    if (!memory->enabled()) return cpu;
++    if (!memory->tracking()) return cpu;
+     return kj::heap<MemoryStartupScope>(*memory, lock, result, kj::mv(cpu));
+   }
+   kj::Own<void> enterLoggingJs(jsg::Lock&, kj::OneOf<kj::Exception, kj::Duration>&) const override {
+@@ -945,6 +945,18 @@ class RustIoChannelFactory final: public IoChannelFactory {
+         loaderChannel, nameStr, kj::heap<DynamicSource>(kj::mv(fetchSource))));
+   }
+ 
++  kj::Array<WorkerLoaderMemorySample> getWorkerLoaderMemoryUsage(uint loaderChannel) override {
++    auto samples = channels->worker_loader_memory_usage(loaderChannel);
++    auto result = kj::heapArrayBuilder<WorkerLoaderMemorySample>(samples.size());
++    for (auto& sample: samples) {
++      result.add(WorkerLoaderMemorySample{
++        .id = kj::str(sample.id),
++        .bytes = sample.bytes,
++      });
++    }
++    return result.finish();
++  }
++
+   kj::Network& getWorkerdDebugPortNetwork() override {
+     requireDebugPort();
+     return worker->factory.getImpl().network;
+@@ -1670,6 +1682,7 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
+   TRACE_EVENT("workerd", "factory_new_worker()", "name", name.cStr());
+   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
+   impl->isDynamic = dynamicSource != kj::none;
++  if (impl->isDynamic) impl->memory->enableMetrics();
+   ErrorReporter errorReporter;
+   auto& options = *factory.options;
+   bool experimental = options.experimental;
+@@ -2007,6 +2020,10 @@ bool worker_memory_enabled(const CompiledWorker& worker) {
+   return worker.getImpl().memory->enabled();
+ }
+ 
++uint64_t worker_sampled_memory_bytes(const CompiledWorker& worker) {
++  return worker.getImpl().memory->getSampledBytes();
++}
++
+ bool worker_memory_retiring(const CompiledWorker& worker) {
+   return worker.getImpl().memory->isRetiring();
+ }
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index 68f6758..9c8350d 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -221,6 +221,7 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
+ void worker_unlink(const CompiledWorker& worker);
+ kj::Own<CompiledWorker> worker_clone(const CompiledWorker& worker);
+ bool worker_memory_enabled(const CompiledWorker& worker);
++uint64_t worker_sampled_memory_bytes(const CompiledWorker& worker);
+ bool worker_memory_retiring(const CompiledWorker& worker);
+ void worker_memory_start_serving(const CompiledWorker& worker);
+ kj::Promise<void> worker_memory_retire(const CompiledWorker& worker);
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index 7ddaa75..eb5918a 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -82,6 +82,11 @@ pub mod ffi {
+         port: u16,
+     }
+ 
++    struct LoaderMemorySample {
++        id: String,
++        bytes: u64,
++    }
++
+     /// An entrypoint the compiled worker exports. `name` is empty for the default export.
+     struct EntrypointInfo {
+         name: String,
+@@ -394,6 +399,7 @@ pub mod ffi {
+         fn worker_unlink(worker: &CompiledWorker);
+         fn worker_clone(worker: &CompiledWorker) -> KjOwn<CompiledWorker>;
+         fn worker_memory_enabled(worker: &CompiledWorker) -> bool;
++        fn worker_sampled_memory_bytes(worker: &CompiledWorker) -> u64;
+         fn worker_memory_retiring(worker: &CompiledWorker) -> bool;
+         fn worker_memory_start_serving(worker: &CompiledWorker);
+         async fn worker_memory_retire(worker: &CompiledWorker) -> Result<()>;
+@@ -920,6 +926,10 @@ pub mod ffi {
+             name: KjMaybe<&str>,
+             source: KjOwn<DynamicSource>,
+         ) -> Result<Box<WorkerStub>>;
++        fn worker_loader_memory_usage(
++            self: &ChannelFactory,
++            loader_channel: u32,
++        ) -> Result<Vec<LoaderMemorySample>>;
+         /// Whether this worker has the workerd debug port binding.
+         fn has_debug_port(self: &ChannelFactory) -> bool;
+ 
+diff --git a/src/workerd/server/server/loader.rs b/src/workerd/server/server/loader.rs
+index 47f1f4c..faf3be2 100644
+--- a/src/workerd/server/server/loader.rs
++++ b/src/workerd/server/server/loader.rs
+@@ -126,6 +126,25 @@ impl WorkerLoaderNamespace {
+             stub.unlink();
+         }
+     }
++
++    /// Samples belong only to successfully started, named workers in this namespace.
++    /// This does not poll startup futures, hold stubs, or run code in the target isolates.
++    pub(crate) fn memory_usage(&self) -> Vec<ffi::LoaderMemorySample> {
++        self.isolates
++            .borrow()
++            .iter()
++            .filter_map(|(id, stub)| {
++                let Some(Ok(service)) = stub.startup.peek() else {
++                    return None;
++                };
++                let bytes = service.sampled_memory_bytes();
++                (!stub.unlinked.get() && bytes != 0).then(|| ffi::LoaderMemorySample {
++                    id: id.clone(),
++                    bytes,
++                })
++            })
++            .collect()
++    }
+ }
+ 
+ /// A loaded dynamic worker. The runtime's `WorkerStubChannel`.
+diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
+index 2df705d..f862389 100644
+--- a/src/workerd/server/server/worker.rs
++++ b/src/workerd/server/server/worker.rs
+@@ -778,6 +778,10 @@ impl WorkerService {
+         ffi::worker_memory_retiring(&self.worker.borrow())
+     }
+ 
++    pub(crate) fn sampled_memory_bytes(&self) -> u64 {
++        ffi::worker_sampled_memory_bytes(&self.worker.borrow())
++    }
++
+     fn reload_after_memory_retirement(
+         self: &Rc<Self>,
+     ) -> Result<Shared<LocalBoxFuture<'static, Result<()>>>> {
+@@ -1300,4 +1304,16 @@ impl ChannelFactory {
+     pub(crate) fn has_debug_port(&self) -> bool {
+         self.0.has_debug_port
+     }
++
++    pub(crate) fn worker_loader_memory_usage(
++        &self,
++        loader_channel: u32,
++    ) -> Result<Vec<ffi::LoaderMemorySample>> {
++        let loader = self
++            .0
++            .worker_loaders
++            .get(loader_channel as usize)
++            .ok_or_else(|| kj::failed!("invalid worker loader channel number"))?;
++        Ok(loader.memory_usage())
++    }
+ }

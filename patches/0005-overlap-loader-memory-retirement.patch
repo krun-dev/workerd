@@ -1,0 +1,398 @@
+diff --git a/src/workerd/server/server/config.rs b/src/workerd/server/server/config.rs
+index eb27593de..9a62a2679 100644
+--- a/src/workerd/server/server/config.rs
++++ b/src/workerd/server/server/config.rs
+@@ -1597,7 +1597,7 @@ impl Server {
+                 access_binding_channel,
+                 has_debug_port: pending.bindings.has_debug_port,
+                 server: Rc::downgrade(self),
+-                abort_isolate: None,
++                on_dynamic_worker_exit: None,
+             },
+             storage_path.as_deref(),
+         )
+diff --git a/src/workerd/server/server/loader.rs b/src/workerd/server/server/loader.rs
+index faf3be211..d3c8afc9a 100644
+--- a/src/workerd/server/server/loader.rs
++++ b/src/workerd/server/server/loader.rs
+@@ -19,6 +19,7 @@ use std::rc::Weak;
+ use futures::FutureExt;
+ use futures::future::LocalBoxFuture;
+ use futures::future::Shared;
++use futures::future::select_ok;
+ use kj_rs::KjMaybe;
+ use kj_rs::KjOwn;
+ use worker::Interface;
+@@ -39,6 +40,7 @@ use crate::channels::WorkerInterface;
+ use crate::channels::attach;
+ use crate::config::Factory;
+ use crate::config::Server;
++use crate::worker::MemoryRetirement;
+ use crate::worker::WorkerService;
+ 
+ /// One `workerLoader` namespace. Bindings with the same `id` share a namespace, so a worker
+@@ -46,9 +48,35 @@ use crate::worker::WorkerService;
+ pub struct WorkerLoaderNamespace {
+     server: Weak<Server>,
+     name: String,
+-    /// The named workers. A worker that aborts its isolate leaves the map, so the next load under
+-    /// its name compiles afresh. Unnamed workers are owned by their JS handles alone.
+-    isolates: RefCell<HashMap<String, Rc<WorkerStub>>>,
++    /// Unnamed workers are owned by their JS handles alone.
++    isolates: RefCell<HashMap<String, NamedWorkers>>,
++}
++
++#[derive(Default)]
++struct NamedWorkers {
++    current: Option<Rc<WorkerStub>>,
++    // Keep retired stubs until native retirement completes. Dropping a stub can unlink its
++    // worker even while it still has background work (such as waitUntil) to finish.
++    draining: Vec<DrainingWorker>,
++}
++
++struct DrainingWorker {
++    stub: Rc<WorkerStub>,
++    retirement: MemoryRetirement,
++}
++
++impl NamedWorkers {
++    fn stubs(&self) -> impl Iterator<Item = &Rc<WorkerStub>> {
++        self.current
++            .iter()
++            .chain(self.draining.iter().map(|old| &old.stub))
++    }
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum DynamicWorkerExit {
++    Abort,
++    MemoryRetired,
+ }
+ 
+ impl WorkerLoaderNamespace {
+@@ -76,26 +104,43 @@ impl WorkerLoaderNamespace {
+         // An isolate's name is never keyed on nor shown to the app; it is for error logs.
+         let stub = match name {
+             Some(name) => {
+-                if let Some(stub) = self.isolates.borrow().get(name) {
+-                    return Ok(Rc::clone(stub));
++                let retirement = {
++                    let isolates = self.isolates.borrow();
++                    if let Some(current) = isolates
++                        .get(name)
++                        .and_then(|workers| workers.current.as_ref())
++                    {
++                        let Some(retirement) = current.memory_retirement() else {
++                            return Ok(Rc::clone(current));
++                        };
++                        Some(retirement)
++                    } else {
++                        None
++                    }
++                };
++                let mut isolates = self.isolates.borrow_mut();
++                let workers = isolates.entry(name.to_owned()).or_default();
++                if let Some((stub, retirement)) = workers.current.take().zip(retirement) {
++                    workers.draining.push(DrainingWorker { stub, retirement });
+                 }
+-                let namespace = Rc::downgrade(self);
+-                let key = name.to_owned();
+-                let on_abort: Box<dyn Fn()> = Box::new(move || {
+-                    if let Some(namespace) = namespace.upgrade() {
+-                        namespace.isolates.borrow_mut().remove(&key);
++
++                // If both generations hit the limit, queue one shared replacement startup.
++                // Its code is fetched only after a slot is free.
++                let startup_after = match workers.draining.as_slice() {
++                    [first, second, ..] => {
++                        Some([first.retirement.clone(), second.retirement.clone()])
+                     }
+-                });
++                    _ => None,
++                };
+                 let stub = WorkerStub::new(
+                     Rc::clone(factory),
+                     Weak::clone(&self.server),
+                     format!("{}:{name}", self.name),
+                     source,
+-                    Some(on_abort),
++                    Some((self, name)),
++                    startup_after,
+                 );
+-                self.isolates
+-                    .borrow_mut()
+-                    .insert(name.to_owned(), Rc::clone(&stub));
++                workers.current = Some(Rc::clone(&stub));
+                 stub
+             }
+             None => WorkerStub::new(
+@@ -104,6 +149,7 @@ impl WorkerLoaderNamespace {
+                 format!("{}:dynamic:{:032x}", self.name, rand::random::<u128>()),
+                 source,
+                 None,
++                None,
+             ),
+         };
+ 
+@@ -120,25 +166,51 @@ impl WorkerLoaderNamespace {
+         Ok(stub)
+     }
+ 
++    fn remove_generation(&self, name: &str, stub: &Weak<WorkerStub>, exit: DynamicWorkerExit) {
++        let mut isolates = self.isolates.borrow_mut();
++        let Some(workers) = isolates.get_mut(name) else {
++            return;
++        };
++        if workers.current.as_ref().is_some_and(|current| {
++            std::ptr::eq(stub.as_ptr(), Rc::as_ptr(current))
++                && (matches!(exit, DynamicWorkerExit::MemoryRetired)
++                    || current.memory_retirement().is_none())
++        }) {
++            workers.current.take();
++        }
++        if matches!(exit, DynamicWorkerExit::MemoryRetired) {
++            workers
++                .draining
++                .retain(|old| !std::ptr::eq(stub.as_ptr(), Rc::as_ptr(&old.stub)));
++        }
++        if workers.current.is_none() && workers.draining.is_empty() {
++            isolates.remove(name);
++        }
++    }
++
+     /// Drops every loaded worker's links, as the server does its own at teardown.
+     pub fn unlink(&self) {
+-        for stub in self.isolates.borrow().values() {
+-            stub.unlink();
++        for workers in self.isolates.borrow().values() {
++            for stub in workers.stubs() {
++                stub.unlink();
++            }
+         }
+     }
+ 
+     /// Samples belong only to successfully started, named workers in this namespace.
+-    /// This does not poll startup futures, hold stubs, or run code in the target isolates.
++    /// Include the old generations until they finish retiring.
+     pub(crate) fn memory_usage(&self) -> Vec<ffi::LoaderMemorySample> {
+         self.isolates
+             .borrow()
+             .iter()
+-            .filter_map(|(id, stub)| {
+-                let Some(Ok(service)) = stub.startup.peek() else {
+-                    return None;
+-                };
+-                let bytes = service.sampled_memory_bytes();
+-                (!stub.unlinked.get() && bytes != 0).then(|| ffi::LoaderMemorySample {
++            .filter_map(|(id, workers)| {
++                let bytes = workers
++                    .stubs()
++                    .filter(|stub| !stub.unlinked.get())
++                    .filter_map(|stub| stub.startup.peek()?.as_ref().ok())
++                    .map(|service| service.sampled_memory_bytes())
++                    .sum();
++                (bytes != 0).then(|| ffi::LoaderMemorySample {
+                     id: id.clone(),
+                     bytes,
+                 })
+@@ -156,35 +228,48 @@ pub struct WorkerStub {
+ }
+ 
+ impl WorkerStub {
+-    /// `on_abort` runs (once) when the worker aborts its isolate; a named stub uses it to leave
+-    /// its namespace. The stub's startup compiles the worker from its source (which the factory
+-    /// fetches) and links it.
+     fn new(
+         factory: Rc<Factory>,
+         server: Weak<Server>,
+         isolate_name: String,
+         source: KjOwn<DynamicSource>,
+-        on_abort: Option<Box<dyn Fn()>>,
++        named: Option<(&Rc<WorkerLoaderNamespace>, &str)>,
++        startup_after: Option<[MemoryRetirement; 2]>,
+     ) -> Rc<Self> {
+-        let fired = Cell::new(false);
+-        let abort_isolate: Box<dyn Fn()> = Box::new(move || {
+-            if fired.replace(true) {
+-                return;
++        Rc::new_cyclic(move |stub| {
++            let named = named.map(|(namespace, key)| (Rc::downgrade(namespace), key.to_owned()));
++            let stub = Weak::clone(stub);
++            let on_exit = Box::new(move |exit| {
++                if let Some((namespace, key)) = &named {
++                    if let Some(namespace) = namespace.upgrade() {
++                        namespace.remove_generation(key, &stub, exit);
++                    }
++                }
++            });
++            let startup = async move {
++                if let Some(retiring) = startup_after {
++                    select_ok(retiring).await?;
++                }
++                WorkerService::new_dynamic(factory, isolate_name, source, server, on_exit).await
+             }
+-            if let Some(on_abort) = &on_abort {
+-                on_abort();
++            .boxed_local()
++            .shared();
++            Self {
++                startup,
++                unlinked: Cell::new(false),
+             }
+-        });
+-        let startup =
+-            WorkerService::new_dynamic(factory, isolate_name, source, server, abort_isolate)
+-                .boxed_local()
+-                .shared();
+-        Rc::new(Self {
+-            startup,
+-            unlinked: Cell::new(false),
+         })
+     }
+ 
++    fn memory_retirement(&self) -> Option<MemoryRetirement> {
++        let service = self.startup.peek()?.as_ref().ok()?;
++        if service.memory_retiring() {
++            service.memory_retirement()
++        } else {
++            None
++        }
++    }
++
+     /// Resolves once the worker has started; fails with the startup error.
+     pub fn startup(&self) -> Shared<LocalBoxFuture<'static, Result<Rc<WorkerService>>>> {
+         self.startup.clone()
+diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
+index f8623897a..c7a45f1b3 100644
+--- a/src/workerd/server/server/worker.rs
++++ b/src/workerd/server/server/worker.rs
+@@ -66,6 +66,7 @@ use crate::config::Server;
+ use crate::config::capnp_error;
+ use crate::config::invalid_config_error;
+ use crate::config::text;
++use crate::loader::DynamicWorkerExit;
+ use crate::loader::WorkerLoaderNamespace;
+ use crate::loader::dynamic_transfer_error;
+ use crate::tasks::TaskHandle;
+@@ -112,16 +113,18 @@ pub struct LinkedChannels {
+     pub server: Weak<Server>,
+     /// How a dynamic worker unloads itself; a static worker aborting its isolate ends the
+     /// process.
+-    pub abort_isolate: Option<Box<dyn Fn()>>,
++    pub(crate) on_dynamic_worker_exit: Option<Box<dyn Fn(DynamicWorkerExit)>>,
+ }
+ 
++pub(crate) type MemoryRetirement = Shared<LocalBoxFuture<'static, Result<()>>>;
++
+ /// A compiled worker and what the service graph hangs off it.
+ pub struct WorkerService {
+     factory: Rc<Factory>,
+     /// The service's name in the config; none for a dynamic worker, which no token can name.
+     service_name: Option<String>,
+     worker: RefCell<KjOwn<ffi::CompiledWorker>>,
+-    retirement: RefCell<Option<Shared<LocalBoxFuture<'static, Result<()>>>>>,
++    retirement: RefCell<Option<MemoryRetirement>>,
+     retirement_task: RefCell<Option<TaskHandle>>,
+     reloading: RefCell<Option<Shared<LocalBoxFuture<'static, Result<()>>>>>,
+     reload_spec: Option<(u32, Rc<ffi::WorkerSpec>, Vec<u64>)>,
+@@ -298,12 +301,12 @@ impl WorkerService {
+     /// itself; the table here is the worker's own `ctx.exports`, numbered after them. A dynamic
+     /// worker has no config, so no namespaces, no pending link and no name a token could carry;
+     /// `name` is for error logs. Compilation errors fail the load rather than being reported.
+-    pub async fn new_dynamic(
++    pub(crate) async fn new_dynamic(
+         factory: Rc<Factory>,
+         name: String,
+         source: KjOwn<DynamicSource>,
+         server: Weak<Server>,
+-        abort_isolate: Box<dyn Fn()>,
++        on_exit: Box<dyn Fn(DynamicWorkerExit)>,
+     ) -> Result<Rc<Self>> {
+         let spec = ffi::WorkerSpec {
+             name,
+@@ -391,7 +394,7 @@ impl WorkerService {
+                 access_binding_channel: None,
+                 has_debug_port: false,
+                 server,
+-                abort_isolate: Some(abort_isolate),
++                on_dynamic_worker_exit: Some(on_exit),
+             },
+             None,
+         )?;
+@@ -751,33 +754,36 @@ impl WorkerService {
+             return;
+         }
+         ffi::worker_memory_start_serving(&worker);
+-        let retirement =
+-            async move { ffi::worker_memory_retire(&worker).await.map_err(Into::into) }
+-                .boxed_local()
+-                .shared();
+         let weak = Rc::downgrade(self);
+-        let monitor = retirement.clone();
+-        let task = self.factory.spawn(async move {
+-            if monitor.await.is_ok() {
+-                if let Some(service) = weak.upgrade() {
+-                    if service.reload_spec.is_none() {
+-                        if let Some(channels) = service.channels.borrow().as_ref() {
+-                            if let Some(abort) = channels.abort_isolate.as_ref() {
+-                                abort();
+-                            }
+-                        }
++        let retirement = async move {
++            ffi::worker_memory_retire(&worker).await?;
++            if let Some(service) = weak.upgrade() {
++                if let Some(channels) = service.channels.borrow().as_ref() {
++                    if let Some(on_exit) = channels.on_dynamic_worker_exit.as_ref() {
++                        on_exit(DynamicWorkerExit::MemoryRetired);
+                     }
+                 }
+             }
++            Ok(())
++        }
++        .boxed_local()
++        .shared();
++        let monitor = retirement.clone();
++        let task = self.factory.spawn(async move {
++            let _ = monitor.await;
+         });
+         *self.retirement.borrow_mut() = Some(retirement);
+         *self.retirement_task.borrow_mut() = Some(task);
+     }
+ 
+-    fn memory_retiring(&self) -> bool {
++    pub(crate) fn memory_retiring(&self) -> bool {
+         ffi::worker_memory_retiring(&self.worker.borrow())
+     }
+ 
++    pub(crate) fn memory_retirement(&self) -> Option<MemoryRetirement> {
++        self.retirement.borrow().clone()
++    }
++
+     pub(crate) fn sampled_memory_bytes(&self) -> u64 {
+         ffi::worker_sampled_memory_bytes(&self.worker.borrow())
+     }
+@@ -796,10 +802,7 @@ impl WorkerService {
+         let spec = Rc::clone(spec);
+         let globals = globals.clone();
+         let retirement = self
+-            .retirement
+-            .borrow()
+-            .as_ref()
+-            .cloned()
++            .memory_retirement()
+             .ok_or_else(|| kj::failed!("worker retirement is not monitored"))?;
+         let service = Rc::downgrade(self);
+         let reloading = async move {
+@@ -1276,9 +1279,9 @@ impl ChannelFactory {
+     /// A dynamic worker unloads. A static worker cannot be replaced, so the call fails; the
+     /// runtime treats that failure as fatal and the process ends.
+     pub(crate) fn abort_isolate(&self, reason: &str) -> Result<()> {
+-        match &self.0.abort_isolate {
+-            Some(abort) => {
+-                abort();
++        match &self.0.on_dynamic_worker_exit {
++            Some(on_exit) => {
++                on_exit(DynamicWorkerExit::Abort);
+                 Ok(())
+             }
+             None => Err(kj::failed!(

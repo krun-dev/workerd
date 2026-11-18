@@ -5,12 +5,24 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Publish VERSION after both Linux builds and tests pass'
+        description: 'Publish VERSION after the Linux AMD64 build and tests pass'
         type: boolean
         default: false
+      reuse_run_id:
+        description: 'Reuse a verified AMD64 artifact from an identical source tree'
+        type: string
+        required: false
   push:
     tags: ['v*-krun.*']
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - 'docker/Dockerfile.build'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'upstream/workerd'
 permissions:
+  actions: read
   contents: read
 concurrency:
   group: release-${{ github.ref }}
@@ -25,8 +37,6 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     steps:
@@ -46,19 +56,114 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: test "$RELEASE_TAG" = "v$(cat VERSION)"
       - name: Make room on GitHub-hosted runners
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' && inputs.reuse_run_id == ''
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/ghc
           docker image prune -af
           df -h .
+      - name: Select Bazel cache
+        id: bazel_cache
+        if: runner.environment == 'github-hosted' && inputs.reuse_run_id == '' && vars.WORKERD_BUILD_CACHE == ''
+        env:
+          PLATFORM: ${{ matrix.runner }}-${{ matrix.arch }}
+          BUILDER: ${{ hashFiles('docker/Dockerfile.build', 'upstream/workerd/.bazelversion') }}
+        run: |
+          upstream=$(git -C upstream/workerd rev-parse HEAD)
+          echo "prefix=workerd-bazel-v1-$PLATFORM-$upstream-$BUILDER-" >> "$GITHUB_OUTPUT"
+      - name: Restore Bazel action cache
+        id: bazel_restore
+        if: steps.bazel_cache.outcome == 'success'
+        uses: actions/cache/restore@v6
+        continue-on-error: true
+        with:
+          path: .build/cache/actions
+          key: ${{ steps.bazel_cache.outputs.prefix }}${{ github.sha }}
+          restore-keys: ${{ steps.bazel_cache.outputs.prefix }}
       - name: Build, test and package
+        if: inputs.reuse_run_id == ''
         env:
           WORKERD_BUILD_JOBS: ${{ vars.WORKERD_BUILD_JOBS || '3' }}
           WORKERD_BUILD_MEMORY_MB: ${{ vars.WORKERD_BUILD_MEMORY_MB || '10000' }}
           DISTRO_CACHE: ${{ vars.WORKERD_BUILD_CACHE }}
+          WORKERD_BUILD_ACTION_CACHE: ${{ steps.bazel_cache.outcome == 'success' && '1' || '0' }}
         run: |
           if [ -n "$DISTRO_CACHE" ]; then export WORKERD_BUILD_CACHE="$DISTRO_CACHE"; fi
           python3 scripts/distro.py release
+      - name: Bound Bazel cache snapshot
+        id: bazel_snapshot
+        if: >-
+          steps.bazel_cache.outcome == 'success' &&
+          steps.bazel_restore.outputs.cache-hit != 'true' &&
+          startsWith(github.ref, 'refs/heads/')
+        continue-on-error: true
+        run: |
+          python3 - <<'PYCODE'
+          import os
+          from pathlib import Path
+
+          cache = Path('.build/cache/actions')
+          # Leave room under GitHub's default 10 GiB repository quota for two snapshots.
+          budget = 4 * 1024**3
+          files = []
+          size = 0
+          for path in cache.rglob('*'):
+              if path.is_file():
+                  stat = path.stat()
+                  files.append((stat.st_mtime_ns, stat.st_size, path))
+                  size += stat.st_size
+          # Bazel treats entries whose referenced blobs have been evicted as cache misses.
+          for _, nbytes, path in sorted(files):
+              if size <= budget:
+                  break
+              path.unlink()
+              size -= nbytes
+          print(f'Bazel action cache snapshot: {size / 1024**3:.2f} GiB')
+          if size:
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  print('ready=true', file=output)
+          PYCODE
+      - name: Save Bazel action cache
+        if: steps.bazel_snapshot.outputs.ready == 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: .build/cache/actions
+          key: ${{ steps.bazel_cache.outputs.prefix }}${{ github.sha }}
+      - name: Download previously verified AMD64 artifact
+        if: inputs.reuse_run_id != ''
+        uses: actions/download-artifact@v8
+        with:
+          name: workerd-linux-x86_64
+          path: dist
+          run-id: ${{ inputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify reused source and artifacts
+        if: inputs.reuse_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REUSE_RUN: ${{ inputs.reuse_run_id }}
+        run: |
+          set -euo pipefail
+          run=$(gh api "repos/$GH_REPO/actions/runs/$REUSE_RUN")
+          test "$(jq -r .conclusion <<< "$run")" = success
+          test "$(jq -r .name <<< "$run")" = 'Build and release'
+          source_sha=$(jq -r .head_sha <<< "$run")
+          git fetch --no-tags origin "$source_sha"
+          git diff --exit-code "$source_sha" HEAD -- . ':!.github/workflows/release.yml'
+          cd dist
+          sha256sum -c *.sha256
+          jq -e --arg version "$(cat ../VERSION)" --arg sha "$source_sha" '.version == $version and .distro_commit == $sha and .distro_dirty == false' *.build-info.json
+          python3 - <<'PYCODE'
+          import glob, hashlib, json, gzip
+          build = json.load(open(glob.glob('*.build-info.json')[0]))
+          tests = json.load(open(glob.glob('*.test-info.json')[0]))
+          with gzip.open('workerd-linux-64.gz', 'rb') as f:
+              digest = hashlib.sha256(f.read()).hexdigest()
+          assert digest == build['binary_sha256'] == tests['binary_sha256']
+          for key in ('checks', 'memory_checks', 'loader_memory_checks', 'cpu_metrics_checks', 'memory_metrics_checks'):
+              assert tests[key] and all(tests[key].values()), key
+          PYCODE
       - uses: actions/upload-artifact@v7
         with:
           name: workerd-linux-${{ matrix.arch }}
@@ -94,14 +199,13 @@ jobs:
           cd dist
           sha256sum -c *.sha256
           test -s workerd-linux-64.gz
-          test -s workerd-linux-arm64.gz
           if tag_sha="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha 2>/dev/null)"; then
             test "$tag_sha" = "$GITHUB_SHA"
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             # A user may have published the Release before the binary was built.
             # Keep its title, notes and prerelease status; retries replace our assets.
-            gh release upload "$RELEASE_TAG" workerd-linux-64.gz workerd-linux-arm64.gz --clobber
+            gh release upload "$RELEASE_TAG" workerd-linux-64.gz --clobber
           else
-            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --generate-notes --title "$RELEASE_TAG" workerd-linux-64.gz workerd-linux-arm64.gz
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --generate-notes --title "$RELEASE_TAG" workerd-linux-64.gz
           fi

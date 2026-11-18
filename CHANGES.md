@@ -2,10 +2,14 @@
 
 ## Unreleased
 
+- Route new requests for a named dynamic Worker to a replacement isolate while accepted requests, response streams, and background tasks finish on the memory-retired isolate. Keep memory retirement to two live generations per name.
+- Build V8 with multiple pointer-compression cages so that independently created Worker isolate groups do not share one 4 GiB heap address space. Each group retains its own cage limit.
+- Expose opt-in V8 heap and external memory samples for successfully started, named dynamic workers in a WorkerLoader namespace.
+- Report best-effort per-request execution-thread CPU time in streaming tail outcomes, with nanosecond transport precision and optional measurement without enforcement.
 - Update the pinned official workerd release to v1.20261116.1 and port the CPU and memory budget patches to its Rust/C++ server architecture and pinned toolchain.
 - Add opt-in per-isolate memory budgets for statically configured and dynamically loaded JavaScript Workers. Retire an exceeded isolate, cancel unfinished work when required, and reload it for later requests.
 - Support Workers RPC and streaming tail sessions while a memory budget is active, including cancellation and bounded delivery of the memory-exceeded outcome. Durable Objects, Workflows, and other unmanaged CustomEvents remain unsupported with this budget. The budget measures V8 heap and external memory, not process RSS.
-- Build and test Linux AMD64 and ARM64 natively, with CPU, memory, dynamic Worker isolation, and packaging checks in the release gate. Publish upstream-compatible Linux executable names.
+- Build and test Linux AMD64 natively, with CPU, memory, dynamic Worker isolation, and packaging checks in the release gate. Publish the upstream-compatible Linux AMD64 executable name.
 
 ## 1.20260920.1-krun.0
 

@@ -69,7 +69,8 @@ def inputs():
     if not patches:
         raise RuntimeError('Empty patch series.')
     files = ['scripts/distro.py', 'scripts/versioning.py', 'docker/Dockerfile.build',
-             'tests/integration.py', 'tests/memory_integration.py', 'tests/loader_memory_integration.py']
+             'tests/integration.py', 'tests/memory_integration.py', 'tests/loader_memory_integration.py',
+             'tests/cpu_metrics_integration.py']
     files += [str(p.relative_to(ROOT)) for p in sorted((ROOT / 'tests/fixtures').iterdir()) if p.is_file()]
     return {'version': version, 'upstream_version': upstream_version,
             'upstream_commit': commit, 'bazel_version': bazel_version, 'patches': patches,
@@ -139,7 +140,11 @@ def build():
         raise RuntimeError('Use positive jobs and at least 1024 MiB build memory.')
     flags = ['--repository_cache=/cache/repository',
              '--config=release_linux', '--strip=always',
-             f'--jobs={jobs}', f'--local_resources=memory={memory}', TARGET]
+             '--@v8//:v8_enable_pointer_compression_shared_cage=False',
+             f'--jobs={jobs}', f'--local_resources=memory={memory}']
+    if os.environ.get('WORKERD_BUILD_ACTION_CACHE') == '1':
+        flags.append('--disk_cache=/cache/actions')
+    flags.append(TARGET)
     network = os.environ.get('WORKERD_BUILD_NETWORK', 'bridge')
     proxy_args = []
     for key in ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
@@ -196,6 +201,8 @@ def test(binary=None):
     shutil.copy2(ROOT / 'tests/integration.py', directory / 'integration.py')
     shutil.copy2(ROOT / 'tests/memory_integration.py', directory / 'memory_integration.py')
     shutil.copy2(ROOT / 'tests/loader_memory_integration.py', directory / 'loader_memory_integration.py')
+    shutil.copy2(ROOT / 'tests/cpu_metrics_integration.py', directory / 'cpu_metrics_integration.py')
+    shutil.copy2(ROOT / 'tests/memory_metrics_integration.py', directory / 'memory_metrics_integration.py')
     (BUILD / 'test.json').unlink(missing_ok=True)
     env = os.environ.copy()
     for key in list(env):
@@ -213,11 +220,21 @@ def test(binary=None):
         raise RuntimeError('Memory budget integration checks failed.')
     run([sys.executable, directory / 'loader_memory_integration.py', binary], env=env)
     loader_memory = json.loads((directory / 'loader-memory-results.json').read_text())
-    if len(loader_memory['checks']) != 14 or not all(loader_memory['checks'].values()):
+    if len(loader_memory['checks']) != 21 or not all(loader_memory['checks'].values()):
         raise RuntimeError('Dynamic WorkerLoader memory integration checks failed.')
+    run([sys.executable, directory / 'cpu_metrics_integration.py', binary], env=env)
+    cpu_metrics = json.loads((directory / 'cpu-metrics-results.json').read_text())
+    if len(cpu_metrics['checks']) != 5 or not all(cpu_metrics['checks'].values()):
+        raise RuntimeError('CPU metrics integration checks failed.')
+    run([sys.executable, directory / 'memory_metrics_integration.py', binary], env=env)
+    memory_metrics = json.loads((directory / 'memory-metrics-results.json').read_text())
+    if len(memory_metrics['checks']) != 6 or not all(memory_metrics['checks'].values()):
+        raise RuntimeError('Memory metrics integration checks failed.')
     write_json(BUILD / 'test.json', {'binary_sha256': sha(binary), 'inputs': inputs(),
                                    'checks': results['checks'], 'memory_checks': memory['checks'],
                                    'loader_memory_checks': loader_memory['checks'],
+                                   'cpu_metrics_checks': cpu_metrics['checks'],
+                                   'memory_metrics_checks': memory_metrics['checks'],
                                    'kernel': platform.release()})
 
 

@@ -15,9 +15,9 @@ WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS=5000 \
 1. **运行**：正常接收请求。
 2. **退出接单**：达到内存预算后停止向旧 isolate 派发新请求。已经进入的 HTTP 请求和 `waitUntil` 可在宽限时间内完成；即使内存随后下降，也不再复用这个实例。
 3. **清理**：在途请求与后台任务完成后立即清理，不等待下一次请求。达到截止时间或紧急内存阈值时强制取消任务和连接，撤销入口引用，释放 isolate。
-4. **重新加载**：下一次请求通过原配置创建并链接新实例，重新执行模块初始化。退出期间的新请求等待旧实例清理；并发请求共享一次重建，避免同时保留多个业务实例。没有新请求就不重建。
+4. **切换**：具名 Worker Loader 收到同一 key 的下一次 `get()` 后，按需创建新实例并重新执行模块初始化。旧实例继续排空，已交给它的请求保留原来的请求体、响应流和执行状态。新请求共享一次启动。每个 Loader key 的内存轮换最多同时保留两代实例；两代都退出接单时，下一代等任一旧实例清理完再启动。
 
-同一业务的退出和重新加载期间会增加请求延迟，其他业务仍可处理请求。同步 JS 阻塞事件循环时，会影响其他业务直至中断；截止时间也不是操作系统硬实时保证。
+请求进入 isolate 后就由该实例处理至结束或被强制终止。已取得的 Loader stub 绑定原实例，应用应通过新的 `get()` 为新请求获取当前实例。静态 Worker 的新请求在旧实例清理后启动替代实例。其他业务仍可处理请求。同步 JS 阻塞事件循环时，会影响其他业务直至中断；截止时间也不是操作系统硬实时保证。
 
 强制终止时，尚未发送响应头的在途 HTTP 请求返回 `503 Service Unavailable`；已经开始的流式响应和 WebSocket 只能中断连接。运行时不自动重放失败请求，已经发送到外部系统的写入不会因取消而撤销。业务的 `finally` 和 JS disposer 不保证执行，清理由宿主执行。
 
@@ -25,7 +25,7 @@ WORKERD_EXPERIMENTAL_MEMORY_DRAIN_MS=5000 \
 
 ## 实现与范围
 
-内存状态、入口引用和截止时间管理位于 `experimental-memory-limit.h`。`factory/worker-factory.c++` 和 `server/worker.rs` 分别接入上游限额接口、WorkerService 清理和创建/链接流程；`factory/BUILD.bazel` 声明新头文件。不修改 CPU 补丁、V8、JSG 或 I/O 核心实现。
+内存状态、入口引用和截止时间管理位于 `experimental-memory-limit.h`。具名 Loader 的在途实例引用、接单代次和并发启动由 `server/loader.rs` 管理。开启 V8 内存采样后，同一 key 的内存样本包含仍在排空的实例。`factory/worker-factory.c++` 和 `server/worker.rs` 分别接入上游限额接口、WorkerService 清理和创建/链接流程；`factory/BUILD.bazel` 声明新头文件。不修改 CPU 补丁、V8、JSG 或 I/O 核心实现。
 
 正常实例不创建内存监控线程。只有进入退出阶段的实例才创建一个等待截止时间的线程；它不轮询，通过线程安全的 `TerminateExecution()` 中断阻塞事件循环的 JS。清理前取消并 join 该线程，避免其访问已销毁的 V8 isolate。KJ 定时器负责异步请求的截止时间，KJ 通知与资源撤销都在事件循环线程执行。
 
@@ -42,7 +42,7 @@ python3 scripts/distro.py build
 python3 scripts/distro.py test
 ```
 
-在 Linux AMD64 上对真实二进制验证：堆、ArrayBuffer、累计分配、在途任务排空和取消、重复重建、流和 WebSocket、外部 fetch、RPC 和 streaming tail 在超限时的清理、动态 Worker 隔离及同时开启 CPU 限制。构建发布流程要求这些测试及 CPU 测试通过。
+Linux AMD64 的发布验证覆盖堆、ArrayBuffer、累计分配、在途任务排空和取消、重复重建、流和 WebSocket、外部 fetch、RPC、streaming tail、动态 Worker 隔离和 CPU 限制。具名 Loader 的回归用例在旧代接收 POST 后暂扣请求体并触发超限，检查新代开始接单、旧代完成原请求及 `waitUntil`、连续超限受两代上限约束。
 
 AMD64 真实二进制已通过 25 项内存、15 项 CPU 和 14 项动态加载检查；另有 10 项发行脚本单元测试。构建与测试核对同一二进制 SHA-256，CI 分别验证两个目标架构。
 
@@ -50,7 +50,7 @@ AMD64 真实二进制已通过 25 项内存、15 项 CPU 和 14 项动态加载�
 
 ## 官方行为与参考
 
-Cloudflare 文档描述超限实例停止接单、让在途请求完成并为后续请求创建新 isolate。本补丁采用有限等待和随后按需重建；期间新请求排队，不实现新旧 isolate 同时服务，也不声称复刻官方未公开的阈值或算法。
+Cloudflare 文档描述超限实例停止接单、让在途请求完成并为后续请求创建新 isolate。这个发行版的宽限时间、紧急余量和 Loader 每个 key 的代数上限是本地策略。
 
 - [Cloudflare Workers 内存限制](https://developers.cloudflare.com/workers/platform/limits/#memory)
 - [workerd #1627：本地堆上限与自动重建讨论（未合并）](https://github.com/cloudflare/workerd/pull/1627#issuecomment-1939193728)
