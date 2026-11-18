@@ -220,7 +220,7 @@ def test(binary=None):
         raise RuntimeError('Memory budget integration checks failed.')
     run([sys.executable, directory / 'loader_memory_integration.py', binary], env=env)
     loader_memory = json.loads((directory / 'loader-memory-results.json').read_text())
-    if len(loader_memory['checks']) != 14 or not all(loader_memory['checks'].values()):
+    if len(loader_memory['checks']) != 21 or not all(loader_memory['checks'].values()):
         raise RuntimeError('Dynamic WorkerLoader memory integration checks failed.')
     run([sys.executable, directory / 'cpu_metrics_integration.py', binary], env=env)
     cpu_metrics = json.loads((directory / 'cpu-metrics-results.json').read_text())

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Route new requests for a named dynamic Worker to a replacement isolate while accepted requests, response streams, and background tasks finish on the memory-retired isolate. Keep memory retirement to two live generations per name.
 - Build V8 with multiple pointer-compression cages so that independently created Worker isolate groups do not share one 4 GiB heap address space. Each group retains its own cage limit.
 - Expose opt-in V8 heap and external memory samples for successfully started, named dynamic workers in a WorkerLoader namespace.
 - Report best-effort per-request execution-thread CPU time in streaming tail outcomes, with nanosecond transport precision and optional measurement without enforcement.
